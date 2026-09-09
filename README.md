@@ -1,5 +1,9 @@
 # Karakeep AI Proxy
 
+**Idiomas / Languages / Langues:** [Español](README.md) | [English](README.en.md) | [Français](README.fr.md)
+
+---
+
 Proxy HTTP en Node.js/TypeScript que se ubica entre [Karakeep](https://github.com/karakeep-app/karakeep) y varios proveedores de inferencia — **Groq**, **Gemini**, **OpenRouter**, **Cloudflare** y **Ollama** — para procesar un backlog masivo de bookmarks sin que ningún rate limit los marque como fallidos en BullMQ.
 
 ## ¿Qué hace?
