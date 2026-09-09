@@ -1,177 +1,235 @@
 # Karakeep AI Proxy
 
+[![Node](https://img.shields.io/badge/node-%3E%3D20-339933?logo=node.js&logoColor=white)](https://nodejs.org)
+[![TypeScript](https://img.shields.io/badge/TypeScript-5.6-3178C6?logo=typescript&logoColor=white)](https://www.typescriptlang.org/)
+[![Tests](https://img.shields.io/badge/tests-vitest-6E9F18?logo=vitest&logoColor=white)](https://vitest.dev/)
+[![Docker](https://img.shields.io/badge/docker-ready-2496ED?logo=docker&logoColor=white)](#option-b--standalone-avec-docker)
+
 **Langues / Languages / Idiomas :** [Español](README.md) | [English](README.en.md) | [Français](README.fr.md)
 
 ---
 
-Proxy HTTP en Node.js/TypeScript intercalé entre [Karakeep](https://github.com/karakeep-app/karakeep) et plusieurs fournisseurs d'inférence — **Groq**, **Gemini**, **OpenRouter**, **Cloudflare** et **Ollama** — afin de traiter un backlog massif de marque-pages sans qu'aucune limite de débit (*rate limit*) ne provoque l'échec des tâches dans BullMQ.
+Proxy HTTP en Node.js/TypeScript, compatible avec l'API OpenAI, intercalé entre [Karakeep](https://github.com/karakeep-app/karakeep) et plusieurs fournisseurs d'inférence LLM (**Groq**, **Gemini**, **OpenRouter**, **Cloudflare Workers AI** et **Ollama**) pour traiter un backlog massif de marque-pages en utilisant **uniquement des forfaits gratuits**, sans que les limites de débit (*rate limits*) ne marquent les tâches en échec.
 
-## Que fait-il ?
+## 🧩 Le problème résolu
 
-- Expose un point de terminaison unique compatible avec l'API OpenAI sur `http://ai-proxy:8080/v1`
-- Applique un **basculement automatique (failover)** : Groq → Gemini → attente (mise en file) pendant la journée
-- La nuit, redirige automatiquement vers l'instance locale **Ollama** sans intervention manuelle
-- Applique un **enrichissement taxonomique à 2 niveaux et une neutralité de posture sur les tags** : intercepte les requêtes d'étiquetage de Karakeep et y injecte la liste des tags canoniques, en imposant un quota strict de 5 étiquettes (2 générales issues de la liste canonique + 3 spécifiques au sujet concret) tout en forçant les étiquettes à refléter la posture réelle ou critique du texte (anti-biais nominal)
-- Mesure le RPM/TPM/TPD par fournisseur et déclenche un failover **proactif** dès 80 % de la limite de quota (avant de recevoir une véritable erreur 429)
-- En cas de véritable réponse 429, traite le fournisseur comme « épuisé » et bascule immédiatement sur le suivant
-- Les requêtes qui ne peuvent pas être traitées immédiatement sont **mises en file d'attente** (au lieu d'être rejetées par une erreur 5xx), évitant ainsi à BullMQ de Karakeep de marquer les tâches en échec
-- File d'attente persistée sur disque (redémarrable sans perte de tâches)
+Karakeep utilise un LLM pour étiqueter et résumer chaque marque-page enregistré. Lorsque le backlog est volumineux (des milliers d'articles), le forfait gratuit de n'importe quel fournisseur s'épuise en quelques minutes, et Karakeep commence à marquer les tâches comme échouées dans BullMQ. Ce proxy sert de couche intermédiaire qui :
 
-## Diagramme d'états
+- Répartit la charge entre **plusieurs fournisseurs gratuits en cascade**, en basculant vers le suivant *avant* d'atteindre la limite de débit réelle (plutôt que d'attendre l'erreur 429).
+- **Met en file d'attente** les requêtes impossibles à traiter immédiatement au lieu de les rejeter, afin que Karakeep ne reçoive jamais d'erreur.
+- La nuit, lorsque le trafic interactif est faible, redirige automatiquement vers un modèle **local (Ollama)** sans restriction de quota.
+- Facultativement, intercepte les requêtes d'étiquetage pour injecter une taxonomie personnalisée de tags canoniques avec des règles strictes de cohérence (voir [Enrichissement des tags et taxonomie](#-enrichissement-des-tags-et-taxonomie-tagenricher)).
 
-```
-[Groq actif]
-   │ RPM/TPM/TPD ≥ 80 % de la limite ──→ [Gemini actif]
-   │ Erreur 429 réelle de Groq        ──→ [Gemini actif]
-   │
-[Gemini actif]
-   │ RPM/TPM/TPD ≥ 80 % de la limite ──→ [En attente / file d'attente]
-   │ Erreur 429 réelle de Gemini      ──→ [En attente / file d'attente]
-   │
-[En attente / file d'attente]
-   │ Groq ou Gemini récupère du quota ──→ [retour au meilleur fournisseur]
-   │ ACTIVE_HOURS_END atteint         ──→ [Ollama actif]
-   │
-[Ollama actif]  ← nuit, sans restriction de quota
-   │ ACTIVE_HOURS_START atteint       ──→ [Groq actif] (réinitialisation des compteurs)
-```
+## 📑 Sommaire
 
-## Installation et configuration
+- [Que fait-il ?](#-que-fait-il-)
+- [Architecture / diagramme d'états](#-architecture--diagramme-détats)
+- [Prérequis](#-prérequis)
+- [Installation](#-installation)
+  - [En conteneur aux côtés de Karakeep (usage prévu)](#option-a--en-conteneur-aux-côtés-de-karakeep-usage-prévu)
+  - [Standalone avec Docker](#option-b--standalone-avec-docker)
+  - [Développement local sans Docker](#option-c--développement-local-sans-docker)
+- [Configuration (variables d'environnement)](#-configuration-variables-denvironnement)
+- [Points de terminaison (endpoints)](#-points-de-terminaison-endpoints)
+- [Enrichissement des tags et taxonomie](#-enrichissement-des-tags-et-taxonomie-tagenricher)
+- [Structure du projet](#-structure-du-projet)
+- [Tests](#-tests)
+- [Limites des forfaits gratuits](#-limites-suggérées-forfaits-gratuits--à-vérifier-sur-chaque-tableau-de-bord)
+- [Dépannage (Troubleshooting)](#-dépannage-troubleshooting)
+- [Licence](#-licence)
 
-### 1. Configurer le proxy
+## ✅ Que fait-il ?
+
+- Expose un point de terminaison unique compatible OpenAI sur `http://ai-proxy:8080/v1`, conçu pour être configuré en tant que `OPENAI_BASE_URL` dans Karakeep (ou tout client compatible avec l'API OpenAI).
+- Applique un **basculement automatique en cascade** entre fournisseurs : `Groq → Gemini → OpenRouter → Cloudflare → file d'attente`, configurable via `PROVIDER_ORDER`.
+- La nuit (en dehors de la plage horaire `ACTIVE_HOURS_START`–`ACTIVE_HOURS_END`), route automatiquement vers **Ollama local**, sans intervention manuelle.
+- Suit le RPM/TPM/TPD/RPD par fournisseur à l'aide de fenêtres glissantes et déclenche un basculement **proactif** dès que `EXHAUSTION_THRESHOLD` est atteint (80 % par défaut) — avant même de recevoir une erreur 429 réelle.
+- Si une erreur 429 survient tout de même, il interprète le fournisseur comme « épuisé » et bascule instantanément.
+- Les requêtes ne pouvant pas être traitées immédiatement sont **mises en file d'attente** (aucune réponse 5xx n'est renvoyée) pour éviter que BullMQ ne marque les tâches en échec.
+- La file d'attente est persistée sur disque (`QUEUE_PERSIST_PATH`), survivant aux redémarrages du conteneur.
+- Expose `GET /status` et `GET /health` pour l'observabilité.
+- Facultativement, **enrichit les requêtes d'étiquetage** de Karakeep avec une taxonomie de tags personnalisée (voir plus bas).
+
+## 🔀 Architecture / diagramme d'états
+
+À haut niveau, le système suit une cascade simple : `Groq → Gemini → OpenRouter → Cloudflare → file d'attente`, et en dehors des heures d'activité (`ACTIVE_HOURS_START`–`ACTIVE_HOURS_END`), tout est acheminé vers Ollama local. L'ordre se configure via `PROVIDER_ORDER`.
+
+La complexité se situe dans la gestion fine de chaque transition :
+
+- **Limitation de débit par fenêtre glissante plutôt que par compteur fixe** : chaque fournisseur suit 4 métriques en parallèle (RPM, TPM, TPD, RPD) avec des fenêtres indépendantes — un compteur simpliste réinitialisé à chaque minute pleine autorise des pointes doubles à la frontière de deux minutes ; la fenêtre glissante l'empêche.
+- **Basculement proactif, et pas seulement réactif** : le proxy bascule dès que `EXHAUSTION_THRESHOLD` (80 % par défaut) de la limite la plus restrictive des 4 métriques est atteint, *avant* que le fournisseur ne renvoie une erreur 429. Si un 429 arrive malgré tout, il est considéré comme un signal supplémentaire d'épuisement.
+- **File d'attente persistée sur disque et non en mémoire** : les requêtes non traitées immédiatement sont écrites dans `QUEUE_PERSIST_PATH` au lieu d'être perdues ; un redémarrage du conteneur (déploiement, OOM, `docker compose down`) n'efface pas le travail en attente.
+- **Arrêt gracieux avec délai d'attente (graceful shutdown)** : à la réception de `SIGTERM`/`SIGINT`, le serveur cesse d'accepter de nouvelles connexions, vide la file sur le disque et accorde 30 s avant de forcer l'arrêt — évitant d'interrompre une écriture en cours.
+- **Rechargement à chaud de la taxonomie de tags** : `canonical_tags.json` est mis en cache mémoire et son horodatage `mtime` est vérifié toutes les 10 secondes, permettant de modifier la liste de tags sans redémarrer le proxy.
+
+Cette logique est couverte par les tests unitaires dans `src/tests/` (`rateLimiter.test.ts`, `activeHours.test.ts`, `providerManager.test.ts`, `tagEnricher.test.ts`), qui reflètent le comportement réel bien mieux que n'importe quel schéma.
+
+## 📋 Prérequis
+
+- Node.js ≥ 20
+- [pnpm](https://pnpm.io/) (le projet utilise `pnpm-lock.yaml`)
+- Docker et Docker Compose (optionnel, recommandé pour la production)
+- Au moins une clé d'API d'un fournisseur pris en charge ([voir tableau des limites](#-limites-suggérées-forfaits-gratuits--à-vérifier-sur-chaque-tableau-de-bord))
+
+## 🚀 Installation
+
+### Option A — En conteneur aux côtés de Karakeep (Usage prévu)
+
+Ce proxy est conçu pour tourner comme un service supplémentaire au sein du fichier `docker-compose.yml` de Karakeep, en y pointant `OPENAI_BASE_URL`.
+
+**1. Configurer le proxy**
 
 ```bash
 cd ai-proxy
 cp .env.example .env
-# Éditer .env avec vos clés d'API réelles
-nano .env
+nano .env   # renseigner les vraies clés d'API
 ```
 
-Variables minimales à définir :
+**2. Ajouter le service au `docker-compose.yml` de Karakeep**
 
-| Variable | Où l'obtenir |
-|---|---|
-| `GROQ_API_KEY` | [console.groq.com/keys](https://console.groq.com/keys) |
-| `GEMINI_API_KEY` | [aistudio.google.com/app/apikey](https://aistudio.google.com/app/apikey) |
-| `TIMEZONE` | Votre fuseau horaire ([liste](https://en.wikipedia.org/wiki/List_of_tz_database_time_zones)) |
+```yaml
+services:
+  ai-proxy:
+    build: ../ai-proxy
+    env_file: ../ai-proxy/.env
+    ports:
+      - "8081:8080"
+    restart: unless-stopped
 
-### 2. Activer le proxy dans Karakeep
-
-```bash
-cd karakeep
-make use-proxy
+  karakeep_worker:
+    environment:
+      - OPENAI_BASE_URL=http://ai-proxy:8080/v1
 ```
 
-Cette commande copie `.env.proxy` → `.env` (définissant `OPENAI_BASE_URL=http://ai-proxy:8080/v1`) et redémarre le worker de Karakeep.
-
-### 3. Démarrer la pile complète
+**3. Lancer la pile**
 
 ```bash
-cd karakeep
 docker compose up -d
 ```
 
-Le service `ai-proxy` est construit automatiquement depuis `../ai-proxy/Dockerfile`.
-
-### 4. Vérifier le bon fonctionnement
+**4. Vérifier le bon fonctionnement**
 
 ```bash
-# État du proxy (fournisseur actif, quota, taille de la file d'attente)
-make proxy-status
-
-# Ou directement via curl
 curl http://localhost:8081/status | python3 -m json.tool
-
-# Journaux (logs) du proxy en temps réel
-make proxy-logs
+docker compose logs -f ai-proxy
 ```
 
-## Arrêter le service
+> Les noms de services, les ports et la manière de redéfinir `OPENAI_BASE_URL` dépendent de l'organisation de votre propre `docker-compose.yml` Karakeep — l'exemple ci-dessus constitue un point de départ, pas un schéma immuable.
 
-### Tout arrêter (libérer RAM et CPU)
+### Option B — Standalone avec Docker
+
+Pour tester le proxy seul, sans Karakeep :
 
 ```bash
-cd ~/Web/karakeep/karakeep
-docker compose down
+cd ai-proxy
+cp .env.example .env
+# Éditer .env avec vos clés d'API
+
+docker build -t ai-proxy .
+docker run -d --name ai-proxy \
+  --env-file .env \
+  -p 8080:8080 \
+  -v $(pwd)/data:/app/data \
+  ai-proxy
 ```
 
-Arrête et supprime tous les conteneurs. Les données (marque-pages, file d'attente du proxy) restent préservées dans les volumes Docker.
-
-### Relancer le service
+### Option C — Développement local (sans Docker)
 
 ```bash
-docker compose up -d
+cd ai-proxy
+pnpm install
+cp .env.example .env
+# Éditer .env
+pnpm run build
+node dist/index.js
+
+# ou en mode watch :
+pnpm run dev
 ```
 
-> L'option `--build` n'est pas nécessaire, sauf si vous avez modifié le code source du proxy.
+## ⚙️ Configuration (variables d'environnement)
 
-### Arrêter uniquement le proxy (garder Karakeep actif)
+Toutes les variables sont documentées avec leurs valeurs par défaut dans [`.env.example`](./.env.example). Résumé par fournisseur :
 
-Si vous devez libérer des ressources tout en maintenant Karakeep en fonctionnement, vous pouvez arrêter seulement le proxy et pointer directement Karakeep vers un fournisseur :
+| Fournisseur | Variables clés | Obligatoire |
+|---|---|---|
+| **Groq** | `GROQ_API_KEY`, `GROQ_MODEL`, `GROQ_RATE_LIMIT_{RPM,TPM,TPD,RPD}` | Oui |
+| **Gemini** | `GEMINI_API_KEY`, `GEMINI_MODEL`, `GEMINI_RATE_LIMIT_{RPM,TPM,TPD,RPD}` | Oui |
+| **OpenRouter** | `OPENROUTER_API_KEY`, `OPENROUTER_MODEL`, `OPENROUTER_RATE_LIMIT_{RPM,RPD}` | Oui |
+| **Cloudflare Workers AI** | `CLOUDFLARE_API_TOKEN`, `CLOUDFLARE_ACCOUNT_ID`, `CLOUDFLARE_MODEL`, `CLOUDFLARE_RATE_LIMIT_{RPM,TPD}` | Oui |
+| **Ollama** (local) | `ENABLE_OLLAMA`, `OLLAMA_BASE_URL`, `OLLAMA_MODEL` | Non (par défaut `true`, requiert une instance active d'Ollama) |
 
-```bash
-docker compose stop ai-proxy
-make use-groq    # ou use-gemini / use-ollama
+> Groq, Gemini, OpenRouter et Cloudflare sont déclarés requis dans `config.ts` (l'application ne démarre pas sans leurs clés). Si vous ne souhaitez pas utiliser l'un d'entre eux, le moyen le plus simple est de renseigner une fausse clé et de l'exclure de `PROVIDER_ORDER`.
+
+Variables générales du proxy :
+
+| Variable | Par défaut | Description |
+|---|---|---|
+| `PROXY_PORT` | `8080` | Port du serveur HTTP |
+| `PROVIDER_ORDER` | `groq,gemini,openrouter,cloudflare` | Ordre de la cascade de basculement |
+| `EXHAUSTION_THRESHOLD` | `0.80` | % de la limite à partir duquel un fournisseur est considéré comme « épuisé » (failover proactif) |
+| `WAIT_MAX_MS` | `20000` | Durée maximale (ms) de maintien de la connexion avant mise en file d'attente |
+| `QUEUE_PERSIST_PATH` | — | Chemin d'enregistrement de la file d'attente entre redémarrages (ex. `/app/data/queue.json`) |
+| `ACTIVE_HOURS_START` / `ACTIVE_HOURS_END` | `07:00` / `22:00` | Plage horaire d'utilisation de la cascade cloud ; en dehors, Ollama prend le relais |
+| `TIMEZONE` | `America/Argentina/Buenos_Aires` | Fuseau horaire pour le calcul de `ACTIVE_HOURS_*` |
+| `LOG_LEVEL` | `info` | `debug` \| `info` \| `warn` \| `error` |
+| `CANONICAL_TAGS_PATH` | `./data/canonical_tags.json` | Chemin du fichier JSON des tags canoniques pour `tagEnricher` (optionnel) |
+
+**Où obtenir chaque clé d'API :**
+
+| Fournisseur | Où l'obtenir |
+|---|---|
+| Groq | [console.groq.com/keys](https://console.groq.com/keys) |
+| Gemini | [aistudio.google.com/app/apikey](https://aistudio.google.com/app/apikey) |
+| OpenRouter | [openrouter.ai/keys](https://openrouter.ai/keys) |
+| Cloudflare Workers AI | [dash.cloudflare.com](https://dash.cloudflare.com/) → *Manage Account → Tokens* (permission *Workers AI*) + Account ID dans *Account Overview* |
+
+## 🔌 Points de terminaison (endpoints)
+
+| Méthode | Route | Description |
+|---|---|---|
+| `POST` | `/v1/*` | Endpoint compatible OpenAI ; redirige vers le fournisseur actif selon la machine d'états |
+| `GET` | `/status` | État actuel : fournisseur actif, consommation du quota par fournisseur, taille de la file |
+| `GET` | `/health` | Vérification de santé basique (`{ ok: true }`) |
+
+Exemple de `GET /status` :
+
+```json
+{
+  "activeProvider": "GROQ",
+  "activeHours": true,
+  "providers": {
+    "groq":       { "exhausted": false, "rpm": { "used": 4, "limit": 30, "pct": 0.13 } },
+    "gemini":     { "exhausted": false, "rpm": { "used": 0, "limit": 15, "pct": 0 } },
+    "openrouter": { "exhausted": false, "rpm": { "used": 0, "limit": 20, "pct": 0 } },
+    "cloudflare": { "exhausted": false, "rpm": { "used": 0, "limit": 300, "pct": 0 } },
+    "ollama":     { "active": false }
+  },
+  "queueSize": 0,
+  "timestamp": "2026-09-09T12:00:00.000Z"
+}
 ```
 
-Pour réactiver le proxy ultérieurement :
+## 🏷️ Enrichissement des tags et taxonomie (`tagEnricher`)
 
-```bash
-docker compose start ai-proxy
-make use-proxy
-```
+Il s'agit d'un module **optionnel** pensé pour des cas d'usage spécifiques (comme un backlog d'articles avec une taxonomie de tags organisée manuellement) ; si cela ne vous est pas utile, il suffit de ne pas renseigner `CANONICAL_TAGS_PATH` / `canonical_tags.json`, et le proxy opérera simplement comme un proxy de basculement standard.
 
-## Limites suggérées (palier gratuit) — à vérifier sur chaque tableau de bord
+Lorsqu'il est activé, le proxy intercepte en toute transparence les requêtes de marquage automatique de Karakeep (`/v1/chat/completions`) et injecte la liste maîtresse des tags canoniques avec des directives de catégorisation :
 
-> ⚠️ Ces valeurs sont des estimations. Les limites réelles varient en fonction de votre offre et du modèle utilisé. **Vérifiez-les sur votre tableau de bord avant toute utilisation en production.**
+1. **Structure obligatoire à 2 niveaux avec quotas fixes (exactement 5 étiquettes)**
+   - **Niveau général (2 étiquettes)** : concepts larges issus de la liste canonique préexistante (ex. `marxismo`, `economia`, `cine`), pour le classement et la recherche globale.
+   - **Niveau spécifique (3 étiquettes)** : un cran plus concret — sous-thème, cas d'étude, auteur, pays, événement ou mécanisme analysé dans le texte (ex. si le niveau général est `marxismo`, le niveau spécifique peut être `teoria-del-valor` ou `acumulacion-por-desposesion`).
+   - Le quota fixe (2 + 3 = 5) empêche les modèles légers (Groq/Gemini Flash/Llama sur Cloudflare) de choisir la facilité en ne retournant que des catégories parapluies.
 
-| Fournisseur | Modèle | RPM | TPM | TPD | ~marque-pages/jour |
-|---|---|---|---|---|---|
-| Groq | `openai/gpt-oss-20b` | 30 | 14 400 | 200 000 | ~80 |
-| Gemini | `gemini-3.5-flash` | 15 | 1 000 000 | illimité | ~400+ |
-| Ollama | `qwen2.5:7b` | ∞ | ∞ | ∞ | ∞ |
+2. **Résolution de la contradiction « normaliser vs détailler »** : le fait qu'un concept large existe déjà dans la liste maîtresse dispense uniquement d'inventer une étiquette générale redondante — cela ne dispense jamais de générer les 3 étiquettes spécifiques de niveau 2.
 
-- Groq : [console.groq.com/settings/limits](https://console.groq.com/settings/limits)
-- Gemini : [ai.google.dev/gemini-api/docs/rate-limits](https://ai.google.dev/gemini-api/docs/rate-limits)
+3. **Neutralité de posture / anti-biais nominal** : chaque étiquette reflète la thèse que l'article *défend réellement*, plutôt que le biais statistique habituel des LLM consistant à attribuer le terme « neutre » d'un concept à des textes qui le critiquent. Si un article critique un concept (ex. philanthropie, libre marché, méritocratie), l'étiquette doit refléter cette critique (`filantrocapitalismo`, `critica-meritocracia`) au lieu d'employer le terme affirmatif (`filantropia`).
 
-## Coordination avec Ollama
+4. **Normalisation stricte (`kebab-case`)** : toutes les étiquettes sont obligatoirement converties en minuscules, séparées par des tirets, sans espaces ni caractères spéciaux. `sanitizeTaggingResponse()` valide et assainit la réponse JSON du modèle avant de la transmettre à Karakeep.
 
-Le proxy détecte automatiquement lorsque l'heure se situe en dehors de la plage horaire `ACTIVE_HOURS_START–ACTIVE_HOURS_END` et route les requêtes vers Ollama. Aucune tâche cron ni commande `make use-ollama` n'est requise.
+5. **Rechargement à chaud** : le fichier de tags canoniques est mis en cache mémoire et son `mtime` est inspecté toutes les 10 secondes, ne se rechargeant que s'il a changé — sans redémarrage de conteneur.
 
-Si vous souhaitez contourner complètement le proxy (urgence, débogage) :
-
-```bash
-make use-ollama   # Karakeep pointe directement vers Ollama sans passer par le proxy
-make use-proxy    # Rétablit l'utilisation du proxy
-```
-
-## Enrichissement des tags et taxonomie (`tagEnricher`)
-
-Le proxy intercepte de manière transparente les requêtes d'étiquetage automatique envoyées par Karakeep (`/v1/chat/completions`) et injecte la liste maîtresse des tags canoniques (`canonical_tags.json`), accompagnée de directives rigoureuses de catégorisation et de cadrage thématique.
-
-### Propriétés du système d'étiquetage :
-
-1. **Structure obligatoire à 2 niveaux avec quotas fixes (exactement 5 tags)** :
-   - **Niveau général (exactement 2 tags)** : Concepts généraux issus de la liste canonique préexistante (`canonical_tags.json`, ~800 tags). Ils servent à la classification et à la recherche globale (ex. `marxismo`, `economia`, `cine`).
-   - **Niveau spécifique (exactement 3 tags)** : Descendent d'un cran conceptuel par rapport au niveau général en désignant le sous-thème, le cas d'étude, l'auteur, le pays, l'événement ou le mécanisme concret analysé dans le texte (ex. si le niveau général est `marxismo`, le niveau spécifique peut être `teoria-del-valor`, `debate-partido-sindicato` ou `acumulacion-por-desposesion`).
-   - Le quota fixe (2 + 3 = 5) évite que les modèles légers (comme ceux de Groq, Gemini Flash ou Llama sur Cloudflare) ne choisissent la solution de facilité en renvoyant uniquement des catégories parapluies trop larges.
-
-2. **Résolution de contradiction sur la règle de spécificité** :
-   - Le LLM reçoit la consigne explicite que l'existence d'un concept général dans la liste maîtresse **l'exempte uniquement d'inventer un tag général redondant**, mais **ne l'exempte jamais de générer les 3 tags spécifiques de niveau 2**. Cela évite que la normalisation ne bloque la création de tags détaillés.
-
-3. **Neutralité de posture et anti-biais nominal (*Stance Neutrality*)** :
-   - Chaque étiquette reflète la thèse que l'article **défend ou soutient concrètement**, contournant le biais statistique courant des LLMs consistant à attribuer le terme nominal ou « neutre » d'un concept à des textes qui le critiquent.
-   - Si un article critique, réfute ou remet en question un concept (ex. philanthropie, libre marché, méritocratie), le tag doit refléter cette critique — via un terme établi (ex. `filantrocapitalismo`) ou descriptif (ex. `critica-meritocracia`, `precarizacion-laboral`) — plutôt que d'employer le nom affirmatif ou neutre (`filantropia`), qui laisserait faussement supposer une posture favorable.
-
-4. **Normalisation stricte (`kebab-case`)** :
-   - Toutes les étiquettes sont obligatoirement formatées en minuscules et composées de mots séparés par des tirets, sans espaces ni caractères spéciaux (`#`, `'`, `"`).
-   - `sanitizeTaggingResponse()` valide et nettoie de façon programmatique la réponse JSON du modèle avant transmission à Karakeep, garantissant une cohérence irréprochable en base de données.
-
-5. **Injection complète de la liste canonique avec rechargement à chaud** :
-   - Préserve la couverture et la cohérence de la taxonomie globale en injectant les ~800 tags canoniques à chaque requête.
-   - Le fichier est mis en cache mémoire et vérifie son horodatage de modification (`mtime`) toutes les 10 secondes pour se recharger automatiquement en cas de mise à jour, sans redémarrage de conteneur.
-
-## Structure du projet
+## 🗂️ Structure du projet
 
 ```
 ai-proxy/
@@ -181,16 +239,18 @@ ai-proxy/
 │   ├── index.ts                     # Point d'entrée, Express, arrêt gracieux
 │   ├── providers/
 │   │   ├── types.ts                 # Interfaces et énumérations
-│   │   ├── rateLimiter.ts           # Fenêtre glissante RPM/TPM + TPD quotidien
-│   │   └── providerManager.ts       # Machine à états Groq/Gemini/Ollama
+│   │   ├── rateLimiter.ts           # Fenêtre glissante RPM/TPM + TPD/RPD quotidien
+│   │   └── providerManager.ts       # Machine à états Groq/Gemini/OpenRouter/Cloudflare/Ollama
 │   ├── proxy/
 │   │   ├── forwardRequest.ts        # Acheminement HTTP + réécriture du modèle
 │   │   ├── handler.ts               # Gestionnaire Express + purge de la file
-│   │   └── tagEnricher.ts           # Intercepteur et injecteur de tags canoniques
+│   │   └── tagEnricher.ts           # Intercepteur et injecteur de tags canoniques (optionnel)
 │   ├── queue/
-│   │   └── requestQueue.ts          # File FIFO avec persistance JSON sur disque
+│   │   └── requestQueue.ts          # File FIFO avec persistance sur disque
 │   ├── routes/
 │   │   └── status.ts                # GET /status + GET /health
+│   ├── scripts/
+│   │   └── manualTagTest.ts         # Script de test manuel pour tagEnricher
 │   └── tests/
 │       ├── rateLimiter.test.ts
 │       ├── activeHours.test.ts
@@ -202,20 +262,43 @@ ai-proxy/
 └── tsconfig.json
 ```
 
-## Développement local (sans Docker)
+## 🧪 Tests
 
 ```bash
 cd ai-proxy
-pnpm install
-cp .env.example .env
-# Éditer .env
-pnpm run build
-node dist/index.js
+pnpm test          # exécution unique
+pnpm test:watch    # mode interactif watch
 ```
 
-## Tests
+Ils couvrent la logique de limitation de débit (fenêtre glissante RPM/TPM/TPD), le calcul des heures d'activité, la machine d'états de `ProviderManager` et le nettoyage des tags dans `tagEnricher`.
 
-```bash
-cd ai-proxy
-pnpm test
-```
+## 📊 Limites suggérées (forfaits gratuits) — à vérifier sur chaque tableau de bord
+
+> ⚠️ Ces valeurs sont des estimations susceptibles de varier selon le forfait et le modèle. **Vérifiez-les sur votre propre tableau de bord avant toute mise en production.**
+
+| Fournisseur | Modèle d'exemple | RPM | TPM | TPD | Coût |
+|---|---|---|---|---|---|
+| Groq | `openai/gpt-oss-20b` | 30 | 14 400 | 200 000 | Gratuit |
+| Gemini | `gemini-flash-lite-latest` | 15 | 1 000 000 | illimité | Gratuit |
+| OpenRouter | modèles `:free` | 20 | — | basé sur crédits | Gratuit |
+| Cloudflare Workers AI | `@cf/meta/llama-3.3-70b-instruct-fp8-fast` | 300 | — | 10 000 neurones/jour | Gratuit |
+| Ollama | `qwen2.5:7b` (local) | ∞ | ∞ | ∞ | Gratuit (votre matériel) |
+
+- Groq : [console.groq.com/settings/limits](https://console.groq.com/settings/limits)
+- Gemini : [ai.google.dev/gemini-api/docs/rate-limits](https://ai.google.dev/gemini-api/docs/rate-limits)
+- OpenRouter : `curl https://openrouter.ai/api/v1/auth/key -H "Authorization: Bearer $OPENROUTER_API_KEY"`
+- Cloudflare : [developers.cloudflare.com/workers-ai](https://developers.cloudflare.com/workers-ai/platform/pricing/)
+
+## 🛠️ Dépannage (Troubleshooting)
+
+| Symptôme | Cause probable | Solution |
+|---|---|---|
+| Le processus ne démarre pas / `Missing required env var` | Clé d'API requise manquante dans `.env` | Renseignez les 4 clés cloud dans `.env`, ou retirez ce fournisseur de `PROVIDER_ORDER` et adaptez `config.ts` si vous souhaitez le rendre facultatif |
+| Toutes les requêtes sont en file d'attente et ne se résolvent jamais | Tous les fournisseurs cloud sont épuisés et `ENABLE_OLLAMA=false` (ou Ollama inaccessible) | Activez Ollama ou attendez la réinitialisation quotidienne des quotas |
+| `ECONNREFUSED` lors de la connexion à Ollama | `OLLAMA_BASE_URL` pointe vers `localhost` depuis l'intérieur d'un conteneur | Utilisez `http://host.docker.internal:11434/v1` (ou le nom d'hôte du service sur votre réseau Docker) |
+| Karakeep continue de requêter directement le fournisseur | `OPENAI_BASE_URL` ne pointe pas vers le proxy | Vérifiez que le worker de Karakeep dispose bien de `OPENAI_BASE_URL=http://ai-proxy:8080/v1` |
+| Les étiquettes ne respectent pas le quota de 5 | `tagEnricher` désactivé ou `canonical_tags.json` manquant | Vérifiez `CANONICAL_TAGS_PATH` et assurez-vous que le fichier existe et soit un JSON valide |
+
+## 📄 Licence
+
+Ce dépôt ne comporte pas encore de fichier `LICENSE`. Si vous envisagez de le partager publiquement, il est conseillé d'en ajouter un (par exemple [MIT](https://choosealicense.com/licenses/mit/)) pour clarifier les conditions d'utilisation du code.

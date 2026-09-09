@@ -3,7 +3,11 @@
 [![Node](https://img.shields.io/badge/node-%3E%3D20-339933?logo=node.js&logoColor=white)](https://nodejs.org)
 [![TypeScript](https://img.shields.io/badge/TypeScript-5.6-3178C6?logo=typescript&logoColor=white)](https://www.typescriptlang.org/)
 [![Tests](https://img.shields.io/badge/tests-vitest-6E9F18?logo=vitest&logoColor=white)](https://vitest.dev/)
-[![Docker](https://img.shields.io/badge/docker-ready-2496ED?logo=docker&logoColor=white)](#-docker)
+[![Docker](https://img.shields.io/badge/docker-ready-2496ED?logo=docker&logoColor=white)](#opción-b--standalone-con-docker)
+
+**Idiomas / Languages / Langues:** [Español](README.md) | [English](README.en.md) | [Français](README.fr.md)
+
+---
 
 Proxy HTTP en Node.js/TypeScript, compatible con la API de OpenAI, que se ubica entre [Karakeep](https://github.com/karakeep-app/karakeep) y varios proveedores de inferencia LLM (**Groq**, **Gemini**, **OpenRouter**, **Cloudflare Workers AI** y **Ollama**) para poder procesar un backlog masivo de bookmarks usando **solo planes gratuitos**, sin que los rate limits los marquen como fallidos.
 
