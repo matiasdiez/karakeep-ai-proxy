@@ -2,6 +2,7 @@ import fs from 'fs';
 import path from 'path';
 import { createLogger } from '../logger.js';
 import { QueuedRequest } from '../providers/types.js';
+import { metrics } from '../metrics.js';
 
 const logger = createLogger('RequestQueue');
 
@@ -82,8 +83,10 @@ export class RequestQueue {
       fs.mkdirSync(dir, { recursive: true });
       fs.writeFileSync(tmpPath, JSON.stringify(this.items, null, 2), 'utf8');
       fs.renameSync(tmpPath, this.persistPath);
+      metrics.recordQueuePersist(true, this.items.length);
     } catch (err) {
       logger.error('Failed to persist queue', err);
+      metrics.recordQueuePersist(false, this.items.length, err instanceof Error ? err.message : String(err));
       try { fs.unlinkSync(tmpPath); } catch { /* tmp file may not have been created */ }
     }
   }

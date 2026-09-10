@@ -166,8 +166,12 @@ REGLAS ESTRICTAS DE ETIQUETADO:
 
 /**
  * Sanitizes LLM response content to ensure all tags in {"tags": [...]} are strictly in kebab-case.
+ *
+ * @param onTagCount Optional callback invoked once per tagging response found,
+ *   with the raw tag count the model returned (pre-truncation) — lets callers
+ *   feed per-provider quality metrics without this module knowing about them.
  */
-export function sanitizeTaggingResponse(responseBuffer: Buffer): Buffer {
+export function sanitizeTaggingResponse(responseBuffer: Buffer, onTagCount?: (count: number) => void): Buffer {
   if (responseBuffer.length === 0) return responseBuffer;
 
   let body: Record<string, unknown>;
@@ -194,6 +198,8 @@ export function sanitizeTaggingResponse(responseBuffer: Buffer): Buffer {
             .filter((t: unknown): t is string => typeof t === 'string' && t.trim().length > 0)
             .map(normalizeToKebab)
             .filter((t: string) => t.length > 0);
+
+          onTagCount?.(sanitizedTags.length);
 
           // Enforce the 5-tag cap requested in the enrichment prompt (2 general +
           // 3 specific). We can't verify the general/specific split from the flat

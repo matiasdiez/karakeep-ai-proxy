@@ -14,6 +14,7 @@ vi.mock('../proxy/forwardRequest.js', () => ({
 }));
 
 import { forwardRequest } from '../proxy/forwardRequest.js';
+import { metrics } from '../metrics.js';
 
 function makeConfig(overrides?: Partial<ProxyConfig>): ProxyConfig {
   return {
@@ -99,6 +100,7 @@ describe('createProxyHandler', () => {
     vi.mocked(forwardRequest).mockReset();
     vi.useFakeTimers();
     vi.setSystemTime(new Date('2026-01-15T15:00:00Z')); // active hours
+    metrics.reset();
   });
 
   it('forwards to the active provider and passes the response through on success', async () => {
@@ -117,6 +119,11 @@ describe('createProxyHandler', () => {
     expect(forwardRequest.mock.calls[0][4].name).toBe(ProviderName.GROQ);
     expect(res.statusCode).toBe(200);
     expect(queue.size()).toBe(0);
+
+    // The fake response body has an empty tags array — that's still a
+    // tagging response, so it should be counted (0 tags, "tooFew").
+    const snap = metrics.snapshot();
+    expect(snap.tagValidation.totalsByProvider[ProviderName.GROQ]?.tooFew).toBe(1);
   });
 
   it('fails over to the next provider on a 429 before succeeding', async () => {
@@ -167,5 +174,9 @@ describe('createProxyHandler', () => {
 
     expect(forwardRequest).not.toHaveBeenCalled();
     expect(res.statusCode).toBe(413);
+
+    const snap = metrics.snapshot();
+    expect(snap.bodyRejections.totals.too_large).toBe(1);
+    expect(snap.bodyRejections.recentEvents[0]?.limitBytes).toBe(10);
   });
 });

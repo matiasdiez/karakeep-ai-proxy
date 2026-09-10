@@ -58,11 +58,11 @@ The non-trivial mechanics lie in the details of each transition:
 
 - **Sliding-window rate limiting instead of fixed counters**: each provider tracks 4 metrics in parallel (RPM, TPM, TPD, RPD) with independent sliding windows. A naive counter that resets every minute allows double bursts across window boundaries; a sliding window prevents this.
 - **Proactive failover, not just reactive**: the proxy switches providers upon reaching `EXHAUSTION_THRESHOLD` (80% by default) of the most restrictive of the 4 metrics, *before* the provider responds with a 429. If a real 429 occurs nonetheless, it is treated as an explicit exhaustion signal.
-- **Disk-persisted queue, not in-memory**: requests that cannot be handled immediately are written to `QUEUE_PERSIST_PATH` instead of being lost; container restarts (deploys, OOMs, `docker compose down`) do not discard pending work.
+- **Atomic disk-persisted queue, not in-memory**: requests that cannot be handled immediately are written to `QUEUE_PERSIST_PATH` instead of being lost. Each write goes to a temporary file first and is then renamed over the final target (`rename` is atomic in POSIX), so a crash midway through writing leaves the previous file intact instead of producing truncated JSON.
 - **Graceful shutdown with timeout**: upon receiving `SIGTERM`/`SIGINT`, it stops accepting new connections, flushes the queue to disk, and allows up to 30s before forcing exit — preventing interrupted writes.
 - **Hot-reloading tag taxonomy**: `canonical_tags.json` is cached in memory with its `mtime` checked every 10s, allowing you to edit the tag list without restarting the proxy.
 
-This behavior is covered by tests in `src/tests/` (`rateLimiter.test.ts`, `activeHours.test.ts`, `providerManager.test.ts`, `tagEnricher.test.ts`), which illustrate the real runtime behavior better than any diagram.
+This behavior is covered by tests in `src/tests/` (`rateLimiter.test.ts`, `activeHours.test.ts`, `providerManager.test.ts`, `tagEnricher.test.ts`, `handler.test.ts`), which illustrate the real runtime behavior better than any diagram.
 
 ## 📋 Requirements
 
@@ -159,7 +159,7 @@ All variables are documented with their default values in [`.env.example`](./.en
 | **Cloudflare Workers AI** | `CLOUDFLARE_API_TOKEN`, `CLOUDFLARE_ACCOUNT_ID`, `CLOUDFLARE_MODEL`, `CLOUDFLARE_RATE_LIMIT_{RPM,TPD}` | Yes |
 | **Ollama** (local) | `ENABLE_OLLAMA`, `OLLAMA_BASE_URL`, `OLLAMA_MODEL` | No (default `true`, requires running Ollama) |
 
-> Groq, Gemini, OpenRouter, and Cloudflare are required in `config.ts` (the process will not start without their API keys). If you do not want to use one of the four, the simplest approach is to leave a dummy key and exclude it from `PROVIDER_ORDER`.
+> Each provider's API key is only required if that provider is listed in `PROVIDER_ORDER`. If, for example, you only want to use Groq and Gemini, you can leave `OPENROUTER_API_KEY` / `CLOUDFLARE_API_TOKEN` empty and remove them from `PROVIDER_ORDER` — the process will start normally.
 
 General proxy variables:
 
@@ -170,6 +170,8 @@ General proxy variables:
 | `EXHAUSTION_THRESHOLD` | `0.80` | % of limit at which a provider is considered "exhausted" (proactive failover) |
 | `WAIT_MAX_MS` | `20000` | Max time (ms) connection is held open before enqueuing |
 | `QUEUE_PERSIST_PATH` | — | Path to persist the queue across restarts (e.g. `/app/data/queue.json`) |
+| `MAX_BODY_BYTES` | `5000000` | Maximum incoming request body size; exceeding this returns `413` |
+| `REQUEST_READ_TIMEOUT_MS` | `30000` | Max time to finish reading incoming body; exceeding this returns `408` |
 | `ACTIVE_HOURS_START` / `ACTIVE_HOURS_END` | `07:00` / `22:00` | Time window during which cloud cascade is used; outside it, Ollama is used |
 | `TIMEZONE` | `America/Argentina/Buenos_Aires` | Timezone used to calculate `ACTIVE_HOURS_*` |
 | `LOG_LEVEL` | `info` | `debug` \| `info` \| `warn` \| `error` |
@@ -225,7 +227,7 @@ When active, the proxy transparently intercepts Karakeep's automatic tagging req
 
 3. **Stance neutrality / anti-nominal bias**: each tag reflects what the article actually *argues*, counteracting the typical statistical bias of LLMs where a nominal or "neutral" concept name is assigned to texts that critique it. If an article criticizes a concept (e.g., philanthropy, free market, meritocracy), the tag must capture that critique (`filantrocapitalismo`, `critica-meritocracia`) rather than using the affirmative term (`filantropia`).
 
-4. **Strict normalization (`kebab-case`)**: all tags are enforced to lowercase words separated by hyphens, with no spaces or special characters. `sanitizeTaggingResponse()` validates and sanitizes the model's JSON response before delivering it to Karakeep.
+4. **Strict normalization (`kebab-case`) and quota validation**: all tags are enforced to lowercase words separated by hyphens, with no spaces or special characters. `sanitizeTaggingResponse()` also counts returned tags: if the model ignored the rule of 5 and returned too many, it truncates them; if it returned too few, it allows them through while emitting a warning log — it cannot reconstruct tags the model never generated, but at least it makes it visible in the logs that the model failed to respect the quota.
 
 5. **Hot reload**: the canonical tags file is cached in memory and its `mtime` is checked every 10 seconds, reloading only if changed — without restarting the container.
 
@@ -255,7 +257,8 @@ ai-proxy/
 │       ├── rateLimiter.test.ts
 │       ├── activeHours.test.ts
 │       ├── providerManager.test.ts
-│       └── tagEnricher.test.ts
+│       ├── tagEnricher.test.ts
+│       └── handler.test.ts          # Integration: failover, queue, body limits
 ├── .env.example
 ├── Dockerfile
 ├── package.json
@@ -270,7 +273,7 @@ pnpm test          # single run
 pnpm test:watch    # watch mode
 ```
 
-They cover rate limiting logic (sliding window RPM/TPM/TPD), active hours calculation, `ProviderManager` state machine, and tag sanitization in `tagEnricher`.
+They cover rate limiting logic (sliding window RPM/TPM/TPD), active hours calculation, the `ProviderManager` state machine, tag sanitization in `tagEnricher`, and, in `handler.test.ts`, the end-to-end handler flow (failover between providers by mocking `forwardRequest`, queuing when no provider is available, and rejection of oversized request bodies).
 
 ## 📊 Suggested Limits (Free Tier) — Verify in Each Dashboard
 
@@ -293,7 +296,9 @@ They cover rate limiting logic (sliding window RPM/TPM/TPD), active hours calcul
 
 | Symptom | Probable Cause | Solution |
 |---|---|---|
-| Process does not start / `Missing required env var` | Missing required API key in `.env` | Fill in the 4 cloud keys in `.env`, or remove that provider from `PROVIDER_ORDER` and adjust `config.ts` if you want to make it optional |
+| Process does not start / `Missing required env var` | Missing API key for a provider that is listed in `PROVIDER_ORDER` | Provide that key in `.env`, or remove that provider from `PROVIDER_ORDER` if you are not using it |
+| `413 Payload too large` | Request body exceeds `MAX_BODY_BYTES` | Increase the limit in `.env` if your requests are legitimately larger |
+| `408 Request body read timeout` | Client did not finish sending body within `REQUEST_READ_TIMEOUT_MS` | Check network connection between Karakeep and the proxy; increase the timeout if your network is slow |
 | All requests are queued and never resolve | All cloud providers exhausted and `ENABLE_OLLAMA=false` (or Ollama unreachable) | Enable Ollama or wait for the daily quota reset |
 | `ECONNREFUSED` against Ollama | `OLLAMA_BASE_URL` points to `localhost` from inside a container | Use `http://host.docker.internal:11434/v1` (or the service hostname on your Docker network) |
 | Karakeep still connects directly to provider | `OPENAI_BASE_URL` does not point to proxy | Verify that the Karakeep worker has `OPENAI_BASE_URL=http://ai-proxy:8080/v1` |

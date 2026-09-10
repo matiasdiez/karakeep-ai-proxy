@@ -58,7 +58,7 @@ Donde está la parte no trivial es en el detalle de cada salto:
 - **Shutdown graceful con timeout**: al recibir `SIGTERM`/`SIGINT`, deja de aceptar conexiones nuevas, vacía la cola a disco y da 30s antes de forzar la salida — para no cortar una escritura a mitad de camino.
 - **Recarga en caliente de la taxonomía de tags**: `canonical_tags.json` se cachea en memoria y se compara su `mtime` cada 10s, así que se puede editar la lista de tags sin reiniciar el proxy.
 
-Esa lógica está cubierta por los tests en `src/tests/` (`rateLimiter.test.ts`, `activeHours.test.ts`, `providerManager.test.ts`, `tagEnricher.test.ts`, `handler.test.ts`), que es donde se ve mejor el comportamiento real que en cualquier diagrama.
+Esa lógica está cubierta por los tests en `src/tests/` (`rateLimiter.test.ts`, `activeHours.test.ts`, `providerManager.test.ts`, `tagEnricher.test.ts`, `requestQueue.test.ts`, `metrics.test.ts`, `handler.test.ts`), que es donde se ve mejor el comportamiento real que en cualquier diagrama.
 
 ## 📋 Requisitos
 
@@ -187,7 +187,7 @@ Variables generales del proxy:
 | Método | Ruta | Descripción |
 |---|---|---|
 | `POST` | `/v1/*` | Endpoint OpenAI-compatible; reenvía al proveedor activo según la máquina de estados |
-| `GET` | `/status` | Estado actual: proveedor activo, uso de cuota por proveedor, tamaño de la cola |
+| `GET` | `/status` | Estado actual: proveedor activo, uso de cuota por proveedor, tamaño de la cola, métricas operativas |
 | `GET` | `/health` | Health check simple (`{ ok: true }`) |
 
 Ejemplo de `GET /status`:
@@ -204,9 +204,42 @@ Ejemplo de `GET /status`:
     "ollama":     { "active": false }
   },
   "queueSize": 0,
+  "metrics": {
+    "bodyRejections": {
+      "totals": { "too_large": 0, "read_timeout": 1 },
+      "recentEvents": [
+        { "timestamp": 1757400000000, "reason": "read_timeout", "elapsedMs": 30000, "limitMs": 30000 }
+      ]
+    },
+    "tagValidation": {
+      "totalsByProvider": {
+        "groq": { "ok": 128, "tooMany": 2, "tooFew": 0 },
+        "cloudflare": { "ok": 40, "tooMany": 0, "tooFew": 11 }
+      },
+      "recentEvents": [
+        { "timestamp": 1757400012000, "provider": "cloudflare", "tagCount": 3, "expected": 5 }
+      ]
+    },
+    "queuePersistence": {
+      "totals": { "success": 340, "failure": 0 },
+      "lastSuccessAt": 1757400020000,
+      "lastFailureAt": null,
+      "recentEvents": [
+        { "timestamp": 1757400020000, "ok": true, "itemCount": 2 }
+      ]
+    }
+  },
   "timestamp": "2026-09-09T12:00:00.000Z"
 }
 ```
+
+`metrics` es un módulo aparte (`src/metrics.ts`), pensado para que un dashboard externo lo consulte por polling sin tener que parsear logs:
+
+- **`bodyRejections`** — cuántas veces se rechazó una solicitud entrante por `MAX_BODY_BYTES` (`too_large`) o `REQUEST_READ_TIMEOUT_MS` (`read_timeout`), con los últimos 50 eventos detallados (bytes recibidos, límite vigente en el momento).
+- **`tagValidation`** — por proveedor, cuántas respuestas de etiquetado tuvieron exactamente 5 tags (`ok`), de más (`tooMany`, se truncan) o de menos (`tooFew`, se dejan pasar tal cual) — útil para detectar si un modelo puntual está degradando en calidad.
+- **`queuePersistence`** — cuántos `persist()` de la cola tuvieron éxito o fallaron, con el timestamp del último de cada tipo — una alerta temprana de un disco lleno o sin permisos, antes de perder la cola de verdad.
+
+Los totales son acumulados desde que arrancó el proceso; los `recentEvents` de cada sección son una ventana de los últimos 50 (se resetean solos, no crecen sin límite). Se resetean todos si el proceso se reinicia — no es una serie de tiempo persistente, es memoria para que algo externo la lea periódicamente.
 
 ## 🏷️ Enriquecimiento de tags y taxonomía (`tagEnricher`)
 
@@ -234,6 +267,7 @@ ai-proxy/
 ├── src/
 │   ├── config.ts                    # Lee y valida env vars
 │   ├── logger.ts                    # Logger con niveles
+│   ├── metrics.ts                   # Contadores en memoria: rechazos de body, validación de tags, persistencia
 │   ├── index.ts                     # Entrada, Express, shutdown graceful
 │   ├── providers/
 │   │   ├── types.ts                 # Interfaces y enums
@@ -244,9 +278,9 @@ ai-proxy/
 │   │   ├── handler.ts               # Handler Express + drainer de cola
 │   │   └── tagEnricher.ts           # Interceptor e inyector de tags canónicos (opcional)
 │   ├── queue/
-│   │   └── requestQueue.ts          # Cola FIFO con persistencia en disco
+│   │   └── requestQueue.ts          # Cola FIFO con persistencia atómica en disco
 │   ├── routes/
-│   │   └── status.ts                # GET /status + GET /health
+│   │   └── status.ts                # GET /status (incluye metrics) + GET /health
 │   ├── scripts/
 │   │   └── manualTagTest.ts         # Script manual para probar el tagEnricher
 │   └── tests/
@@ -254,6 +288,8 @@ ai-proxy/
 │       ├── activeHours.test.ts
 │       ├── providerManager.test.ts
 │       ├── tagEnricher.test.ts
+│       ├── requestQueue.test.ts
+│       ├── metrics.test.ts
 │       └── handler.test.ts        # Integración: failover, cola, límites de body
 ├── .env.example
 ├── Dockerfile
@@ -269,7 +305,7 @@ pnpm test          # una corrida
 pnpm test:watch    # modo watch
 ```
 
-Cubren la lógica de rate limiting (ventana deslizante RPM/TPM/TPD), el cálculo de horario activo, la máquina de estados del `ProviderManager`, el saneamiento de tags del `tagEnricher` y, en `handler.test.ts`, el flujo completo del handler (failover entre proveedores mockeando `forwardRequest`, encolado cuando no hay proveedor disponible, rechazo de bodies demasiado grandes).
+Cubren la lógica de rate limiting (ventana deslizante RPM/TPM/TPD), el cálculo de horario activo, la máquina de estados del `ProviderManager`, el saneamiento de tags del `tagEnricher`, la persistencia atómica de `requestQueue` (incluyendo el caso de escritura fallida), los contadores de `metrics` y, en `handler.test.ts`, el flujo completo del handler (failover entre proveedores mockeando `forwardRequest`, encolado cuando no hay proveedor disponible, rechazo de bodies demasiado grandes).
 
 ## 📊 Límites sugeridos (tier gratuito) — verificar en cada dashboard
 

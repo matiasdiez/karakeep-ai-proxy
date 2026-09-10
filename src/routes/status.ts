@@ -1,6 +1,7 @@
 import { Router } from 'express';
 import { ProviderManager } from '../providers/providerManager.js';
 import { RequestQueue } from '../queue/requestQueue.js';
+import { metrics } from '../metrics.js';
 
 /**
  * GET /status — returns current proxy state as JSON.
@@ -16,6 +17,7 @@ export function createStatusRouter(
     res.json({
       ...stats,
       queueSize: queue.size(),
+      metrics: metrics.snapshot(),
       timestamp: new Date().toISOString(),
     });
   });

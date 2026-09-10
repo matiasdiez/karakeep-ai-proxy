@@ -6,6 +6,7 @@ import { ProviderName, QueuedRequest } from '../providers/types.js';
 import { RequestQueue } from '../queue/requestQueue.js';
 import { forwardRequest, estimateTokens } from './forwardRequest.js';
 import { enrichTaggingRequest, sanitizeTaggingResponse } from './tagEnricher.js';
+import { metrics } from '../metrics.js';
 
 const logger = createLogger('Handler');
 
@@ -28,6 +29,7 @@ function readBody(req: Request, maxBytes: number, timeoutMs: number): Promise<Bu
   return new Promise((resolve, reject) => {
     const timer = setTimeout(() => {
       req.destroy();
+      metrics.recordBodyRejection('read_timeout', { elapsedMs: timeoutMs, limitMs: timeoutMs });
       reject(new BodyReadTimeoutError(`Body not fully received within ${timeoutMs}ms`));
     }, timeoutMs);
     timer.unref?.();
@@ -44,6 +46,7 @@ function readBody(req: Request, maxBytes: number, timeoutMs: number): Promise<Bu
       total += chunk.length;
       if (total > maxBytes) {
         done(() => reject(new BodyTooLargeError(`Request body exceeds ${maxBytes} bytes`)));
+        metrics.recordBodyRejection('too_large', { bytesReceived: total, limitBytes: maxBytes });
         req.destroy();
         return;
       }
@@ -156,7 +159,7 @@ export function createProxyHandler(
         'te', 'trailers', 'transfer-encoding', 'upgrade',
       ]);
 
-      const responseBody = sanitizeTaggingResponse(result.body);
+      const responseBody = sanitizeTaggingResponse(result.body, (count) => metrics.recordTagCount(provider.name, count));
 
       for (const [key, value] of Object.entries(result.headers)) {
         if (!hopByHop.has(key.toLowerCase()) && key.toLowerCase() !== 'content-length') {
@@ -203,7 +206,7 @@ export function createProxyHandler(
               'connection', 'keep-alive', 'proxy-authenticate', 'proxy-authorization',
               'te', 'trailers', 'transfer-encoding', 'upgrade',
             ]);
-            const responseBody = sanitizeTaggingResponse(result.body);
+            const responseBody = sanitizeTaggingResponse(result.body, (count) => metrics.recordTagCount(recoveredProvider.name, count));
             for (const [key, value] of Object.entries(result.headers)) {
               if (!hopByHop.has(key.toLowerCase()) && key.toLowerCase() !== 'content-length') {
                 res.setHeader(key, value);

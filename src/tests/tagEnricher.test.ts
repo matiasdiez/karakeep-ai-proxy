@@ -216,5 +216,51 @@ describe('TagEnricher', () => {
 
       expect(sanitized).toEqual(buffer);
     });
+
+    it('truncates to 5 tags when the model returns more', () => {
+      const llmResponse = {
+        choices: [{ message: { content: '{"tags": ["a", "b", "c", "d", "e", "f", "g"]}' } }],
+      };
+      const buffer = Buffer.from(JSON.stringify(llmResponse), 'utf-8');
+      const sanitized = sanitizeTaggingResponse(buffer);
+
+      const parsed = JSON.parse(sanitized.toString('utf-8'));
+      const parsedContent = JSON.parse(parsed.choices[0].message.content);
+      expect(parsedContent.tags).toEqual(['a', 'b', 'c', 'd', 'e']);
+    });
+
+    it('passes through as-is (without inventing tags) when the model returns fewer than 5', () => {
+      const llmResponse = {
+        choices: [{ message: { content: '{"tags": ["a", "b"]}' } }],
+      };
+      const buffer = Buffer.from(JSON.stringify(llmResponse), 'utf-8');
+      const sanitized = sanitizeTaggingResponse(buffer);
+
+      const parsed = JSON.parse(sanitized.toString('utf-8'));
+      const parsedContent = JSON.parse(parsed.choices[0].message.content);
+      expect(parsedContent.tags).toEqual(['a', 'b']);
+    });
+
+    it('invokes onTagCount with the raw (pre-truncation) count for each tagging response found', () => {
+      const llmResponse = {
+        choices: [{ message: { content: '{"tags": ["a", "b", "c", "d", "e", "f"]}' } }],
+      };
+      const buffer = Buffer.from(JSON.stringify(llmResponse), 'utf-8');
+
+      const counts: number[] = [];
+      sanitizeTaggingResponse(buffer, (count) => counts.push(count));
+
+      expect(counts).toEqual([6]);
+    });
+
+    it('does not call onTagCount for a response with no tags array', () => {
+      const llmResponse = { choices: [{ message: { content: 'not json tags' } }] };
+      const buffer = Buffer.from(JSON.stringify(llmResponse), 'utf-8');
+
+      const counts: number[] = [];
+      sanitizeTaggingResponse(buffer, (count) => counts.push(count));
+
+      expect(counts).toEqual([]);
+    });
   });
 });
