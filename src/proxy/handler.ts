@@ -12,6 +12,49 @@ const logger = createLogger('Handler');
 /** Maximum number of provider attempts per incoming request before queuing */
 const MAX_PROVIDER_ATTEMPTS = 2;
 
+class BodyTooLargeError extends Error {}
+class BodyReadTimeoutError extends Error {}
+
+/**
+ * Reads the incoming request body into a single Buffer, enforcing both a max
+ * size (protects against OOM from an oversized or malicious payload) and a
+ * read timeout (protects against a client that opens a connection and never
+ * finishes sending — there was previously no bound on this at all).
+ */
+function readBody(req: Request, maxBytes: number, timeoutMs: number): Promise<Buffer> {
+  const chunks: Buffer[] = [];
+  let total = 0;
+
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      req.destroy();
+      reject(new BodyReadTimeoutError(`Body not fully received within ${timeoutMs}ms`));
+    }, timeoutMs);
+    timer.unref?.();
+
+    let settled = false;
+    const done = (fn: () => void) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      fn();
+    };
+
+    req.on('data', (chunk: Buffer) => {
+      total += chunk.length;
+      if (total > maxBytes) {
+        done(() => reject(new BodyTooLargeError(`Request body exceeds ${maxBytes} bytes`)));
+        req.destroy();
+        return;
+      }
+      chunks.push(chunk);
+    });
+
+    req.on('end', () => done(() => resolve(Buffer.concat(chunks))));
+    req.on('error', (err: Error) => done(() => reject(err)));
+  });
+}
+
 /**
  * Main proxy handler.
  *
@@ -28,14 +71,29 @@ export function createProxyHandler(
   providerManager: ProviderManager,
   queue: RequestQueue,
   waitMaxMs = 20_000,
+  maxBodyBytes = 5_000_000,
+  requestReadTimeoutMs = 30_000,
 ) {
   return async function handler(req: Request, res: Response): Promise<void> {
-    // Collect body
-    const chunks: Buffer[] = [];
-    for await (const chunk of req) {
-      chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk as string));
+    // Collect body (bounded by size and time — see readBody())
+    let rawBodyBuffer: Buffer;
+    try {
+      rawBodyBuffer = await readBody(req, maxBodyBytes, requestReadTimeoutMs);
+    } catch (err) {
+      if (err instanceof BodyTooLargeError) {
+        logger.warn(`Rejecting request: ${err.message}`);
+        res.status(413).json({ error: 'Payload too large' });
+        return;
+      }
+      if (err instanceof BodyReadTimeoutError) {
+        logger.warn(`Rejecting request: ${err.message}`);
+        res.status(408).json({ error: 'Request body read timeout' });
+        return;
+      }
+      logger.error('Error reading request body', err);
+      res.status(400).json({ error: 'Failed to read request body' });
+      return;
     }
-    const rawBodyBuffer = Buffer.concat(chunks);
     const bodyBuffer = enrichTaggingRequest(rawBodyBuffer);
 
     // Sanitize incoming headers into a plain Record<string, string>

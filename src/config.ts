@@ -9,6 +9,19 @@ function requireEnv(name: string): string {
   return val;
 }
 
+/**
+ * Like requireEnv(), but only enforced when `providerKey` actually appears in
+ * PROVIDER_ORDER. A provider that's excluded from the cascade doesn't need a
+ * real API key — this lets you run with e.g. only Groq + Ollama configured
+ * instead of having to set dummy keys for all four cloud providers.
+ */
+function requireEnvIfUsed(providerKey: string, providerOrder: string[], name: string): string {
+  if (!providerOrder.includes(providerKey)) {
+    return optionalEnv(name, '');
+  }
+  return requireEnv(name);
+}
+
 function optionalEnv(name: string, defaultVal: string): string {
   return process.env[name] ?? defaultVal;
 }
@@ -83,14 +96,33 @@ export interface ProxyConfig {
   waitMaxMs: number;
   enableOllama: boolean;
   providerOrder: string[];
+
+  maxBodyBytes: number;
+  requestReadTimeoutMs: number;
 }
 
 export function loadConfig(): ProxyConfig {
+  // Parsed first: whether a cloud provider's API key is required depends on
+  // whether it's actually in the cascade.
+  const providerOrder = optionalEnv('PROVIDER_ORDER', 'groq,gemini,openrouter,cloudflare')
+    .split(',')
+    .map(s => s.trim().toLowerCase())
+    .filter(s => s.length > 0);
+
+  const enableOllama = process.env['ENABLE_OLLAMA'] !== 'false';
+
+  if (providerOrder.length === 0 && !enableOllama) {
+    throw new Error(
+      'No provider is usable: PROVIDER_ORDER is empty and ENABLE_OLLAMA=false. ' +
+      'Add at least one provider to PROVIDER_ORDER or enable Ollama.',
+    );
+  }
+
   return {
     port: optionalInt('PROXY_PORT', 8080),
 
     groq: {
-      apiKey: requireEnv('GROQ_API_KEY'),
+      apiKey: requireEnvIfUsed('groq', providerOrder, 'GROQ_API_KEY'),
       baseUrl: optionalEnv('GROQ_BASE_URL', 'https://api.groq.com/openai/v1'),
       model: optionalEnv('GROQ_MODEL', 'openai/gpt-oss-20b'),
       rateLimitRpm: optionalInt('GROQ_RATE_LIMIT_RPM', 30),
@@ -100,7 +132,7 @@ export function loadConfig(): ProxyConfig {
     },
 
     gemini: {
-      apiKey: requireEnv('GEMINI_API_KEY'),
+      apiKey: requireEnvIfUsed('gemini', providerOrder, 'GEMINI_API_KEY'),
       baseUrl: optionalEnv('GEMINI_BASE_URL', 'https://generativelanguage.googleapis.com/v1beta/openai'),
       model: optionalEnv('GEMINI_MODEL', 'gemini-flash-lite-latest'),
       rateLimitRpm: optionalInt('GEMINI_RATE_LIMIT_RPM', 15),
@@ -110,7 +142,7 @@ export function loadConfig(): ProxyConfig {
     },
 
     openrouter: {
-      apiKey: requireEnv('OPENROUTER_API_KEY'),
+      apiKey: requireEnvIfUsed('openrouter', providerOrder, 'OPENROUTER_API_KEY'),
       baseUrl: optionalEnv('OPENROUTER_BASE_URL', 'https://openrouter.ai/api/v1'),
       model: optionalEnv('OPENROUTER_MODEL', 'nvidia/nemotron-3-super-120b-a12b:free'),
       rateLimitRpm: optionalInt('OPENROUTER_RATE_LIMIT_RPM', 20),
@@ -118,8 +150,8 @@ export function loadConfig(): ProxyConfig {
     },
 
     cloudflare: {
-      apiToken: requireEnv('CLOUDFLARE_API_TOKEN'),
-      accountId: requireEnv('CLOUDFLARE_ACCOUNT_ID'),
+      apiToken: requireEnvIfUsed('cloudflare', providerOrder, 'CLOUDFLARE_API_TOKEN'),
+      accountId: requireEnvIfUsed('cloudflare', providerOrder, 'CLOUDFLARE_ACCOUNT_ID'),
       baseUrl: optionalEnv('CLOUDFLARE_BASE_URL', 'https://api.cloudflare.com/client/v4/accounts'),
       model: optionalEnv('CLOUDFLARE_MODEL', '@cf/meta/llama-3.3-70b-instruct-fp8-fast'),
       rateLimitRpm: optionalInt('CLOUDFLARE_RATE_LIMIT_RPM', 300),
@@ -138,7 +170,10 @@ export function loadConfig(): ProxyConfig {
     queuePersistPath: process.env['QUEUE_PERSIST_PATH'] ?? null,
     exhaustionThreshold: optionalFloat('EXHAUSTION_THRESHOLD', 0.80),
     waitMaxMs: optionalInt('WAIT_MAX_MS', 20000),
-    enableOllama: process.env['ENABLE_OLLAMA'] !== 'false',
-    providerOrder: (optionalEnv('PROVIDER_ORDER', 'groq,gemini,openrouter,cloudflare')).split(',').map(s => s.trim().toLowerCase()),
+    enableOllama,
+    providerOrder,
+
+    maxBodyBytes: optionalInt('MAX_BODY_BYTES', 5_000_000), // 5 MB
+    requestReadTimeoutMs: optionalInt('REQUEST_READ_TIMEOUT_MS', 30_000),
   };
 }

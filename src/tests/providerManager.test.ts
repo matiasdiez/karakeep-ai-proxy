@@ -26,6 +26,21 @@ function makeConfig(overrides?: Partial<ProxyConfig>): ProxyConfig {
       rateLimitTpd: 500000,
       rateLimitRpd: 1500,
     },
+    openrouter: {
+      apiKey: 'test-openrouter-key',
+      baseUrl: 'https://openrouter.ai/api/v1',
+      model: 'nvidia/nemotron-3-super-120b-a12b:free',
+      rateLimitRpm: 20,
+      rateLimitRpd: 50,
+    },
+    cloudflare: {
+      apiToken: 'test-cloudflare-token',
+      accountId: 'test-account-id',
+      baseUrl: 'https://api.cloudflare.com/client/v4/accounts',
+      model: '@cf/meta/llama-3.3-70b-instruct-fp8-fast',
+      rateLimitRpm: 300,
+      rateLimitTpd: 10000,
+    },
     ollama: {
       baseUrl: 'http://host.docker.internal:11434/v1',
       model: 'qwen2.5:7b',
@@ -36,6 +51,10 @@ function makeConfig(overrides?: Partial<ProxyConfig>): ProxyConfig {
     queuePersistPath: null,
     exhaustionThreshold: 0.80,
     waitMaxMs: 20000,
+    enableOllama: true,
+    providerOrder: ['groq', 'gemini', 'openrouter', 'cloudflare'],
+    maxBodyBytes: 5_000_000,
+    requestReadTimeoutMs: 30_000,
     ...overrides,
   };
 }
@@ -79,10 +98,30 @@ describe('ProviderManager', () => {
     expect(pm.getActiveProvider()?.name).toBe(ProviderName.GEMINI);
   });
 
-  it('returns null when both Groq and Gemini are exhausted', () => {
+  it('falls over through the full cascade before returning null', () => {
     const pm = new ProviderManager(makeConfig());
+    expect(pm.getActiveProvider()?.name).toBe(ProviderName.GROQ);
+
+    pm.markExhausted(ProviderName.GROQ);
+    expect(pm.getActiveProvider()?.name).toBe(ProviderName.GEMINI);
+
+    pm.markExhausted(ProviderName.GEMINI);
+    expect(pm.getActiveProvider()?.name).toBe(ProviderName.OPENROUTER);
+
+    pm.markExhausted(ProviderName.OPENROUTER);
+    expect(pm.getActiveProvider()?.name).toBe(ProviderName.CLOUDFLARE);
+
+    pm.markExhausted(ProviderName.CLOUDFLARE);
+    // All 4 cloud providers exhausted, and it's active hours → falls to Ollama.
+    expect(pm.getActiveProvider()?.name).toBe(ProviderName.OLLAMA);
+  });
+
+  it('returns null when all cloud providers are exhausted and Ollama is disabled', () => {
+    const pm = new ProviderManager(makeConfig({ enableOllama: false }));
     pm.markExhausted(ProviderName.GROQ);
     pm.markExhausted(ProviderName.GEMINI);
+    pm.markExhausted(ProviderName.OPENROUTER);
+    pm.markExhausted(ProviderName.CLOUDFLARE);
     expect(pm.getActiveProvider()).toBeNull();
   });
 
@@ -162,10 +201,12 @@ describe('ProviderManager', () => {
     expect(stats.activeHours).toBe(false);
   });
 
-  it('getStats shows WAITING when both exhausted during active hours', () => {
-    const pm = new ProviderManager(makeConfig());
+  it('getStats shows WAITING when all cloud providers are exhausted and Ollama is disabled', () => {
+    const pm = new ProviderManager(makeConfig({ enableOllama: false }));
     pm.markExhausted(ProviderName.GROQ);
     pm.markExhausted(ProviderName.GEMINI);
+    pm.markExhausted(ProviderName.OPENROUTER);
+    pm.markExhausted(ProviderName.CLOUDFLARE);
 
     const stats = pm.getStats();
     expect(stats.activeProvider).toBe('WAITING');

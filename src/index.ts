@@ -34,7 +34,13 @@ async function main() {
   // app.use() como catch-all: captura todo lo que no fue manejado por las rutas
   // de status/health arriba. Compatible con Express 4.x (app.all('*') y el
   // wildcard /*splat son sintaxis de Express 5 y no funcionan en Express 4).
-  const proxyHandler = createProxyHandler(providerManager, queue, config.waitMaxMs);
+  const proxyHandler = createProxyHandler(
+    providerManager,
+    queue,
+    config.waitMaxMs,
+    config.maxBodyBytes,
+    config.requestReadTimeoutMs,
+  );
   app.use(proxyHandler);
 
   // Nota: el 404 catch-all ya no es necesario porque proxyHandler responde

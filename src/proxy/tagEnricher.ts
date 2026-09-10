@@ -190,10 +190,22 @@ export function sanitizeTaggingResponse(responseBuffer: Buffer): Buffer {
       try {
         const parsedContent = JSON.parse(cleanContent);
         if (parsedContent && Array.isArray(parsedContent.tags)) {
-          const sanitizedTags = parsedContent.tags
+          let sanitizedTags = parsedContent.tags
             .filter((t: unknown): t is string => typeof t === 'string' && t.trim().length > 0)
             .map(normalizeToKebab)
             .filter((t: string) => t.length > 0);
+
+          // Enforce the 5-tag cap requested in the enrichment prompt (2 general +
+          // 3 specific). We can't verify the general/specific split from the flat
+          // response array alone, but we CAN catch and correct a model that ignored
+          // the count — silently letting through 3 or 9 tags defeats the whole
+          // point of the fixed-quota rule.
+          if (sanitizedTags.length > 5) {
+            logger.warn(`Model returned ${sanitizedTags.length} tags, expected 5 — truncating`);
+            sanitizedTags = sanitizedTags.slice(0, 5);
+          } else if (sanitizedTags.length < 5) {
+            logger.warn(`Model returned only ${sanitizedTags.length} tags, expected 5 — passing through as-is`);
+          }
 
           parsedContent.tags = sanitizedTags;
           choice.message.content = JSON.stringify(parsedContent);

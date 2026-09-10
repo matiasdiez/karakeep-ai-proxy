@@ -15,11 +15,14 @@ export interface ActiveProvider {
 /**
  * State machine managing which provider is currently active.
  *
- * Priority / fallback order:
- *   GROQ → GEMINI → WAITING (queue) → OLLAMA (outside active hours)
+ * Priority / fallback order (during active hours):
+ *   providerOrder[0] → providerOrder[1] → ... → WAITING (queue)
  *
- * "Active hours" are the configured daytime window. During that window the
- * proxy tries Groq first, then Gemini. Outside that window it routes to Ollama.
+ * "Active hours" are the configured daytime window (ACTIVE_HOURS_START–
+ * ACTIVE_HOURS_END). Outside that window, if Ollama is enabled, it's used
+ * directly — the cloud cascade above is skipped entirely so free-tier quota
+ * is preserved for daytime traffic. If Ollama is disabled, the cloud cascade
+ * runs regardless of time of day.
  */
 export class ProviderManager {
   private readonly config: ProxyConfig;
@@ -84,7 +87,14 @@ export class ProviderManager {
    * provider is available (requests should be queued).
    */
   getActiveProvider(tokenEstimate = 500): ActiveProvider | null {
-    // Try providers in priority order, regardless of active hours
+    // Outside active hours, prefer Ollama directly — this is the whole point
+    // of having a local fallback: save cloud free-tier quota for daytime use
+    // instead of burning through it overnight just because it's available.
+    if (!this.isInActiveHours() && this.config.enableOllama) {
+      return this.ollamaProvider();
+    }
+
+    // Try cloud providers in priority order
     for (const provider of this.config.providerOrder) {
       if (provider === 'groq' && !this.groqExhausted && this.groqLimiter.canSend(tokenEstimate)) {
         return {
@@ -280,24 +290,28 @@ export class ProviderManager {
     const cloudflareStats = this.cloudflareLimiter.getStats();
 
     let activeProvider = 'WAITING';
-    for (const provider of this.config.providerOrder) {
-      if (provider === 'groq' && !this.groqExhausted && this.groqLimiter.canSend(0)) {
-        activeProvider = 'GROQ';
-        break;
-      } else if (provider === 'gemini' && !this.geminiExhausted && this.geminiLimiter.canSend(0)) {
-        activeProvider = 'GEMINI';
-        break;
-      } else if (provider === 'openrouter' && !this.openrouterExhausted && this.openrouterLimiter.canSend(0)) {
-        activeProvider = 'OPENROUTER';
-        break;
-      } else if (provider === 'cloudflare' && !this.cloudflareExhausted && this.cloudflareLimiter.canSend(0)) {
-        activeProvider = 'CLOUDFLARE';
-        break;
-      }
-    }
-    
-    if (activeProvider === 'WAITING' && this.config.enableOllama) {
+    if (!activeHours && this.config.enableOllama) {
       activeProvider = 'OLLAMA';
+    } else {
+      for (const provider of this.config.providerOrder) {
+        if (provider === 'groq' && !this.groqExhausted && this.groqLimiter.canSend(0)) {
+          activeProvider = 'GROQ';
+          break;
+        } else if (provider === 'gemini' && !this.geminiExhausted && this.geminiLimiter.canSend(0)) {
+          activeProvider = 'GEMINI';
+          break;
+        } else if (provider === 'openrouter' && !this.openrouterExhausted && this.openrouterLimiter.canSend(0)) {
+          activeProvider = 'OPENROUTER';
+          break;
+        } else if (provider === 'cloudflare' && !this.cloudflareExhausted && this.cloudflareLimiter.canSend(0)) {
+          activeProvider = 'CLOUDFLARE';
+          break;
+        }
+      }
+
+      if (activeProvider === 'WAITING' && this.config.enableOllama) {
+        activeProvider = 'OLLAMA';
+      }
     }
 
     return {

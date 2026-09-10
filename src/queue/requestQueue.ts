@@ -68,14 +68,23 @@ export class RequestQueue {
 
   // ── Private helpers ─────────────────────────────────────────────────────────
 
+  /**
+   * Writes the queue to disk atomically: write to a temp file in the same
+   * directory, then rename over the real path. `rename` is atomic on POSIX
+   * filesystems, so a crash mid-write leaves either the old file or the new
+   * one intact — never a truncated/corrupt one.
+   */
   private persist(): void {
     if (!this.persistPath) return;
+    const tmpPath = `${this.persistPath}.tmp-${process.pid}`;
     try {
       const dir = path.dirname(this.persistPath);
       fs.mkdirSync(dir, { recursive: true });
-      fs.writeFileSync(this.persistPath, JSON.stringify(this.items, null, 2), 'utf8');
+      fs.writeFileSync(tmpPath, JSON.stringify(this.items, null, 2), 'utf8');
+      fs.renameSync(tmpPath, this.persistPath);
     } catch (err) {
       logger.error('Failed to persist queue', err);
+      try { fs.unlinkSync(tmpPath); } catch { /* tmp file may not have been created */ }
     }
   }
 

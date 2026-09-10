@@ -3,11 +3,7 @@
 [![Node](https://img.shields.io/badge/node-%3E%3D20-339933?logo=node.js&logoColor=white)](https://nodejs.org)
 [![TypeScript](https://img.shields.io/badge/TypeScript-5.6-3178C6?logo=typescript&logoColor=white)](https://www.typescriptlang.org/)
 [![Tests](https://img.shields.io/badge/tests-vitest-6E9F18?logo=vitest&logoColor=white)](https://vitest.dev/)
-[![Docker](https://img.shields.io/badge/docker-ready-2496ED?logo=docker&logoColor=white)](#opción-b--standalone-con-docker)
-
-**Idiomas / Languages / Langues:** [Español](README.md) | [English](README.en.md) | [Français](README.fr.md)
-
----
+[![Docker](https://img.shields.io/badge/docker-ready-2496ED?logo=docker&logoColor=white)](#-docker)
 
 Proxy HTTP en Node.js/TypeScript, compatible con la API de OpenAI, que se ubica entre [Karakeep](https://github.com/karakeep-app/karakeep) y varios proveedores de inferencia LLM (**Groq**, **Gemini**, **OpenRouter**, **Cloudflare Workers AI** y **Ollama**) para poder procesar un backlog masivo de bookmarks usando **solo planes gratuitos**, sin que los rate limits los marquen como fallidos.
 
@@ -58,11 +54,11 @@ Donde está la parte no trivial es en el detalle de cada salto:
 
 - **Rate limiting por ventana deslizante, no por contador fijo**: cada proveedor trackea 4 métricas en paralelo (RPM, TPM, TPD, RPD) con ventanas independientes — un contador ingenuo que resetea cada minuto exacto permite ráfagas dobles en el borde de la ventana; la ventana deslizante no.
 - **Failover proactivo, no solo reactivo**: el proxy cambia de proveedor al llegar a `EXHAUSTION_THRESHOLD` (80% por defecto) del límite más restrictivo de las 4 métricas, *antes* de que el proveedor devuelva un 429. Si igual llega un 429 real, lo toma como señal adicional de agotamiento.
-- **Cola persistida en disco, no en memoria**: las solicitudes que no se pueden procesar se escriben a `QUEUE_PERSIST_PATH` en vez de perderse; un restart del contenedor (deploy, OOM, `docker compose down`) no descarta trabajo pendiente.
+- **Cola persistida en disco de forma atómica, no en memoria**: las solicitudes que no se pueden procesar se escriben a `QUEUE_PERSIST_PATH` en vez de perderse. Cada escritura va primero a un archivo temporal y después se renombra sobre el definitivo (`rename` es atómico en POSIX), así que un crash a mitad de escritura deja el archivo anterior intacto en vez de un JSON truncado.
 - **Shutdown graceful con timeout**: al recibir `SIGTERM`/`SIGINT`, deja de aceptar conexiones nuevas, vacía la cola a disco y da 30s antes de forzar la salida — para no cortar una escritura a mitad de camino.
 - **Recarga en caliente de la taxonomía de tags**: `canonical_tags.json` se cachea en memoria y se compara su `mtime` cada 10s, así que se puede editar la lista de tags sin reiniciar el proxy.
 
-Esa lógica está cubierta por los tests en `src/tests/` (`rateLimiter.test.ts`, `activeHours.test.ts`, `providerManager.test.ts`, `tagEnricher.test.ts`), que es donde se ve mejor el comportamiento real que en cualquier diagrama.
+Esa lógica está cubierta por los tests en `src/tests/` (`rateLimiter.test.ts`, `activeHours.test.ts`, `providerManager.test.ts`, `tagEnricher.test.ts`, `handler.test.ts`), que es donde se ve mejor el comportamiento real que en cualquier diagrama.
 
 ## 📋 Requisitos
 
@@ -159,7 +155,7 @@ Todas las variables están documentadas con sus valores por defecto en [`.env.ex
 | **Cloudflare Workers AI** | `CLOUDFLARE_API_TOKEN`, `CLOUDFLARE_ACCOUNT_ID`, `CLOUDFLARE_MODEL`, `CLOUDFLARE_RATE_LIMIT_{RPM,TPD}` | Sí |
 | **Ollama** (local) | `ENABLE_OLLAMA`, `OLLAMA_BASE_URL`, `OLLAMA_MODEL` | No (default `true`, requiere Ollama corriendo) |
 
-> Groq, Gemini, OpenRouter y Cloudflare son requeridos en `config.ts` (el proceso no arranca sin sus API keys). Si no querés usar alguno de los cuatro, la forma más simple es dejar una key dummy y excluirlo de `PROVIDER_ORDER`.
+> La API key de cada proveedor solo es obligatoria si ese proveedor aparece en `PROVIDER_ORDER`. Si por ejemplo solo querés usar Groq y Gemini, podés dejar `OPENROUTER_API_KEY` / `CLOUDFLARE_API_TOKEN` vacíos y sacarlos de `PROVIDER_ORDER` — el proceso arranca igual.
 
 Variables generales del proxy:
 
@@ -170,6 +166,8 @@ Variables generales del proxy:
 | `EXHAUSTION_THRESHOLD` | `0.80` | % del límite en el que se considera "agotado" un proveedor (failover proactivo) |
 | `WAIT_MAX_MS` | `20000` | Tiempo máx. (ms) que se mantiene abierta la conexión antes de encolar |
 | `QUEUE_PERSIST_PATH` | — | Path para persistir la cola entre reinicios (ej. `/app/data/queue.json`) |
+| `MAX_BODY_BYTES` | `5000000` | Tamaño máximo del body de una solicitud entrante; por encima devuelve `413` |
+| `REQUEST_READ_TIMEOUT_MS` | `30000` | Tiempo máx. para terminar de recibir el body entrante; por encima devuelve `408` |
 | `ACTIVE_HOURS_START` / `ACTIVE_HOURS_END` | `07:00` / `22:00` | Ventana horaria en la que se usa la cascada cloud; fuera de ella, Ollama |
 | `TIMEZONE` | `America/Argentina/Buenos_Aires` | Zona horaria para calcular `ACTIVE_HOURS_*` |
 | `LOG_LEVEL` | `info` | `debug` \| `info` \| `warn` \| `error` |
@@ -225,7 +223,7 @@ Cuando está activo, el proxy intercepta de forma transparente las solicitudes d
 
 3. **Neutralidad de postura / anti-sesgo nominal**: cada etiqueta refleja lo que el artículo efectivamente *argumenta*, en vez del sesgo estadístico típico de los LLM de asignar el nombre "neutro" del concepto a textos que lo cuestionan. Si un artículo critica un concepto (ej. filantropía, libre mercado, meritocracia), la etiqueta debe capturar esa crítica (`filantrocapitalismo`, `critica-meritocracia`) en vez del término afirmativo (`filantropia`).
 
-4. **Normalización estricta (`kebab-case`)**: todas las etiquetas se fuerzan a minúsculas, separadas por guiones, sin espacios ni caracteres especiales. `sanitizeTaggingResponse()` valida y sanea la respuesta JSON del modelo antes de entregarla a Karakeep.
+4. **Normalización estricta (`kebab-case`) y validación del cupo**: todas las etiquetas se fuerzan a minúsculas, separadas por guiones, sin espacios ni caracteres especiales. `sanitizeTaggingResponse()` además cuenta las etiquetas devueltas: si el modelo ignoró la regla de las 5 y devolvió de más, las trunca; si devolvió de menos, lo deja pasar mientras avisa por log — no puede reconstruir tags que el modelo nunca generó, pero al menos queda visible en los logs que el modelo no respetó el cupo.
 
 5. **Recarga en caliente**: el archivo de tags canónicos se cachea en memoria y su `mtime` se revisa cada 10 segundos, recargándose solo si cambió — sin reiniciar el contenedor.
 
@@ -255,7 +253,8 @@ ai-proxy/
 │       ├── rateLimiter.test.ts
 │       ├── activeHours.test.ts
 │       ├── providerManager.test.ts
-│       └── tagEnricher.test.ts
+│       ├── tagEnricher.test.ts
+│       └── handler.test.ts        # Integración: failover, cola, límites de body
 ├── .env.example
 ├── Dockerfile
 ├── package.json
@@ -270,7 +269,7 @@ pnpm test          # una corrida
 pnpm test:watch    # modo watch
 ```
 
-Cubren la lógica de rate limiting (ventana deslizante RPM/TPM/TPD), el cálculo de horario activo, la máquina de estados del `ProviderManager` y el saneamiento de tags del `tagEnricher`.
+Cubren la lógica de rate limiting (ventana deslizante RPM/TPM/TPD), el cálculo de horario activo, la máquina de estados del `ProviderManager`, el saneamiento de tags del `tagEnricher` y, en `handler.test.ts`, el flujo completo del handler (failover entre proveedores mockeando `forwardRequest`, encolado cuando no hay proveedor disponible, rechazo de bodies demasiado grandes).
 
 ## 📊 Límites sugeridos (tier gratuito) — verificar en cada dashboard
 
@@ -293,7 +292,9 @@ Cubren la lógica de rate limiting (ventana deslizante RPM/TPM/TPD), el cálculo
 
 | Síntoma | Causa probable | Solución |
 |---|---|---|
-| El proceso no arranca / `Missing required env var` | Falta una API key obligatoria en `.env` | Completá las 4 keys cloud en `.env`, o quitá ese proveedor de `PROVIDER_ORDER` y ajustá `config.ts` si querés hacerlo opcional |
+| El proceso no arranca / `Missing required env var` | Falta la API key de un proveedor que sí está en `PROVIDER_ORDER` | Completá esa key en `.env`, o sacá ese proveedor de `PROVIDER_ORDER` si no lo vas a usar |
+| `413 Payload too large` | El body de la solicitud supera `MAX_BODY_BYTES` | Subí el límite en `.env` si tus solicitudes son legítimamente grandes |
+| `408 Request body read timeout` | El cliente no terminó de enviar el body dentro de `REQUEST_READ_TIMEOUT_MS` | Revisá la conexión entre Karakeep y el proxy; subí el timeout si tu red es lenta |
 | Todas las requests se encolan y nunca se resuelven | Todos los proveedores cloud agotados y `ENABLE_OLLAMA=false` (o Ollama no accesible) | Activá Ollama o esperá el reset diario de cuota |
 | `ECONNREFUSED` contra Ollama | `OLLAMA_BASE_URL` apunta a `localhost` desde dentro de un contenedor | Usá `http://host.docker.internal:11434/v1` (o el hostname del servicio en tu red de Docker) |
 | Karakeep sigue pegándole directo al proveedor | `OPENAI_BASE_URL` no apunta al proxy | Verificá que el worker de Karakeep tenga `OPENAI_BASE_URL=http://ai-proxy:8080/v1` |

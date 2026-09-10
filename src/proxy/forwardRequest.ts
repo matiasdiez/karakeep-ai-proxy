@@ -137,7 +137,6 @@ export async function forwardRequest(
       }
       logger.info(`← ${provider.name.toUpperCase()} ${responseRaw.status} (${tokensUsed} tokens)`);
     }
-    logger.warn(`← ${provider.name.toUpperCase()} ${responseRaw.status}`);
   }
 
   return {
