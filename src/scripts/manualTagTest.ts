@@ -20,7 +20,7 @@
 import fs from 'fs';
 import path from 'path';
 import { loadConfig } from '../config.js';
-import { enrichTaggingRequest, STRUCTURED_OUTPUT_SUPPORTED_PROVIDERS } from '../proxy/tagEnricher.js';
+import { enrichTaggingRequest, sanitizeTaggingResponse, STRUCTURED_OUTPUT_SUPPORTED_PROVIDERS } from '../proxy/tagEnricher.js';
 
 // ── Carga simple de .env sin agregar dotenv como dependencia nueva ──────────
 function loadDotEnv(): void {
@@ -50,7 +50,11 @@ const providerArg = (getArg('provider') || 'groq').toLowerCase();
 const modelOverride = getArg('model');
 const filePath = getArg('file');
 const inlineText = getArg('text');
-const tagsPath = getArg('tags-path'); // opcional, por defecto usa CANONICAL_TAGS_PATH / ./data/canonical_tags.json
+// IMPORTANTE: resolvemos esto acá, explícitamente, en vez de dejar que
+// tagEnricher.ts use su default interno — ese default se fija en memoria
+// cuando el import se ejecuta, ANTES de que loadDotEnv() corra, así que
+// nunca vería CANONICAL_TAGS_PATH aunque esté en tu .env.
+const tagsPath = getArg('tags-path') || process.env['CANONICAL_TAGS_PATH'] || './data/canonical_tags.json';
 
 if (!filePath && !inlineText) {
   console.error('Falta --file <ruta.txt> o --text "contenido del artículo"');
@@ -58,6 +62,15 @@ if (!filePath && !inlineText) {
 }
 
 const articleText = inlineText ?? fs.readFileSync(filePath as string, 'utf8');
+
+// Chequeo temprano: si esto no existe, enrichTaggingRequest va a devolver el
+// body SIN TOCAR (sin rulesText, sin response_format) y vas a gastar cuota
+// probando el prompt original de Karakeep sin ninguno de nuestros cambios.
+if (!fs.existsSync(tagsPath)) {
+  console.error(`✗ No encontré el archivo de tags canónicos en: ${tagsPath}`);
+  console.error(`  Pasá la ruta correcta con --tags-path <ruta>, o seteá CANONICAL_TAGS_PATH en tu .env.`);
+  process.exit(1);
+}
 
 // ── Arma el body EXACTAMENTE con la forma que Karakeep manda a tagging ──────
 // (isKarakeepTaggingRequest busca esta frase literal en el content)
@@ -154,6 +167,15 @@ async function main(): Promise<void> {
   const content = data?.choices?.[0]?.message?.content;
   console.log('── Respuesta cruda del modelo (message.content) ───────────');
   console.log(content ?? JSON.stringify(data, null, 2));
+
+  // Corre el mismo sanitizeTaggingResponse que usa producción — esto imprime
+  // el warning de CRITERIO A (vía logger) si algún específico coincide con la
+  // lista canónica, y muestra el {"tags": [...]} final que le llegaría a Karakeep.
+  const sanitizedBuffer = sanitizeTaggingResponse(Buffer.from(JSON.stringify(data), 'utf8'), tagsPath);
+  const sanitizedData = JSON.parse(sanitizedBuffer.toString('utf8'));
+  console.log('');
+  console.log('── {"tags": [...]} final que recibiría Karakeep ───────────');
+  console.log(sanitizedData?.choices?.[0]?.message?.content ?? '(sin cambios)');
 }
 
 main().catch((err) => {

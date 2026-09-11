@@ -285,20 +285,26 @@ export function sanitizeTaggingResponse(responseBuffer: Buffer, customTagsPath?:
           const rawTags = structuredTags ?? (Array.isArray(parsedContent.tags) ? parsedContent.tags : null);
 
           if (rawTags) {
-            const sanitizedTags = rawTags
+            let sanitizedTags = rawTags
               .filter((t: unknown): t is string => typeof t === 'string' && t.trim().length > 0)
               .map(normalizeToKebab)
               .filter((t: string) => t.length > 0);
 
             // Validación programática del CRITERIO A: si esto vino del shape estructurado,
-            // las posiciones 2-4 son especifico_1/2/3 — no deberían estar en la lista maestra.
+            // las posiciones 2 en adelante son las específicas — no deberían estar en la
+            // lista maestra. A diferencia de antes, ahora se DESCARTAN (no solo se loguean):
+            // es preferible un bookmark con menos etiquetas que una específica reciclada de
+            // la lista general. Puede resultar en quedarse solo con general_1/general_2 si
+            // las 4 específicas violan el criterio — aceptado como comportamiento válido.
             if (structuredTags && canonicalSet.size > 0) {
+              const generales = sanitizedTags.slice(0, 2);
               const especificos = sanitizedTags.slice(2);
               const violaciones = especificos.filter((tag: string) => canonicalSet.has(tag));
               if (violaciones.length > 0) {
                 logger.warn(
-                  `CRITERIO A violado (en código, no por el modelo): las etiquetas específicas [${violaciones.join(', ')}] están en la lista canónica — el modelo no las detectó. Quedan igual en la respuesta por ahora, esto solo loguea para diagnóstico.`
+                  `CRITERIO A violado (en código, no por el modelo): se descartan las etiquetas específicas [${violaciones.join(', ')}] por coincidir con la lista canónica — el modelo no las detectó como tales.`
                 );
+                sanitizedTags = [...generales, ...especificos.filter((tag: string) => !canonicalSet.has(tag))];
               }
             }
 

@@ -205,7 +205,7 @@ describe('TagEnricher', () => {
       });
     });
 
-    it('detects in code when a specific field violates CRITERIO A (matches the canonical list) even though the model missed it', () => {
+    it('discards in code a specific field that violates CRITERIO A (matches the canonical list), keeping the rest intact', () => {
       const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
 
       const llmResponse = {
@@ -228,11 +228,50 @@ describe('TagEnricher', () => {
       };
 
       const buffer = Buffer.from(JSON.stringify(llmResponse), 'utf-8');
-      sanitizeTaggingResponse(buffer, tempTagsPath);
+      const sanitized = sanitizeTaggingResponse(buffer, tempTagsPath);
 
       const warnedText = warnSpy.mock.calls.map((call) => call.join(' ')).join('\n');
       expect(warnedText).toContain('CRITERIO A violado');
       expect(warnedText).toContain('economia');
+
+      // "economia" se descarta; las generales y las específicas válidas quedan intactas
+      const parsed = JSON.parse(sanitized.toString('utf-8'));
+      const parsedContent = JSON.parse(parsed.choices[0].message.content);
+      expect(parsedContent).toEqual({
+        tags: ['politica', 'marxismo', 'ley-omnibus', 'fondo-sojero', 'instituto-patria'],
+      });
+
+      warnSpy.mockRestore();
+    });
+
+    it('discards ALL specific fields if all of them violate CRITERIO A, leaving only the 2 general tags', () => {
+      const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+      const llmResponse = {
+        choices: [
+          {
+            message: {
+              role: 'assistant',
+              // Las 4 específicas están en tempTagsPath — caso límite: debe quedar solo con las 2 generales
+              content: JSON.stringify({
+                general_1: 'politica',
+                general_2: 'marxismo',
+                especifico_1: 'economia',
+                especifico_2: 'redes-sociales',
+                especifico_3: 'economia',
+                especifico_4: 'marxismo',
+              }),
+            },
+          },
+        ],
+      };
+
+      const buffer = Buffer.from(JSON.stringify(llmResponse), 'utf-8');
+      const sanitized = sanitizeTaggingResponse(buffer, tempTagsPath);
+
+      const parsed = JSON.parse(sanitized.toString('utf-8'));
+      const parsedContent = JSON.parse(parsed.choices[0].message.content);
+      expect(parsedContent).toEqual({ tags: ['politica', 'marxismo'] });
 
       warnSpy.mockRestore();
     });
