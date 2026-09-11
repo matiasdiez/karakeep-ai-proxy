@@ -323,6 +323,7 @@ ai-proxy/
 │       └── handler.test.ts        # Integración: failover, cola, límites de body
 ├── .env.example
 ├── Dockerfile
+├── LICENSE                          # Licencia GNU AGPLv3
 ├── package.json
 ├── tsconfig.json
 ├── PROVIDER_SETUP.md                # Guía de setup y rotación de proveedores
@@ -370,4 +371,6 @@ Cubren la lógica de rate limiting (ventana deslizante RPM/TPM/TPD), el cálculo
 
 ## 📄 Licencia
 
-Este repositorio todavía no incluye un archivo `LICENSE`. Si vas a compartirlo públicamente, te conviene agregar uno (por ejemplo [MIT](https://choosealicense.com/licenses/mit/)) para dejar en claro qué pueden hacer otros con el código.
+Este proyecto está licenciado bajo la **[GNU Affero General Public License v3 (AGPL-3.0-or-later)](./LICENSE)**.
+
+Elegida en defensa del bien común y los principios democráticos del software libre: podés usar, estudiar, modificar y compartir este proxy con total libertad, con la condición de que cualquier modificación o servicio derivado ofrecido a través de una red conserve la misma licencia libre y ponga su código fuente a disposición de la comunidad.

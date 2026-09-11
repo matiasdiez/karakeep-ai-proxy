@@ -2,3 +2,4 @@
 node_modules/
 dist/
 data/canonical_tags.json
+src/scripts/cfk-milei.txt

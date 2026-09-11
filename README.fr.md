@@ -323,6 +323,7 @@ ai-proxy/
 │       └── handler.test.ts          # Intégration : basculement, file d'attente, limites du corps de requête
 ├── .env.example
 ├── Dockerfile
+├── LICENSE                          # Licence GNU AGPLv3
 ├── package.json
 ├── tsconfig.json
 ├── PROVIDER_SETUP.md                # Guide de configuration et rotation des fournisseurs
@@ -370,4 +371,6 @@ Ils couvrent la logique de limitation de débit (fenêtre glissante RPM/TPM/TPD)
 
 ## 📄 Licence
 
-Ce dépôt ne comporte pas encore de fichier `LICENSE`. Si vous envisagez de le partager publiquement, il est conseillé d'en ajouter un (par exemple [MIT](https://choosealicense.com/licenses/mit/)) pour clarifier les conditions d'utilisation du code.
+Ce projet est sous licence **[GNU Affero General Public License v3 (AGPL-3.0-or-later)](./LICENSE)**.
+
+Choisie pour préserver les biens communs numériques et les principes démocratiques du logiciel libre : vous êtes libre d'utiliser, d'étudier, de modifier et de redistribuer ce proxy, à condition que toute modification ou service dérivé exécuté sur un réseau conserve la même licence libre et mette son code source à la disposition de la communauté.

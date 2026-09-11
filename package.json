@@ -3,6 +3,7 @@
   "version": "1.0.0",
   "description": "Rate-limiting proxy between Karakeep and Groq/Gemini/Ollama",
   "main": "dist/index.js",
+  "license": "AGPL-3.0-or-later",
   "scripts": {
     "build": "tsc",
     "start": "node dist/index.js",
