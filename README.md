@@ -3,7 +3,11 @@
 [![Node](https://img.shields.io/badge/node-%3E%3D20-339933?logo=node.js&logoColor=white)](https://nodejs.org)
 [![TypeScript](https://img.shields.io/badge/TypeScript-5.6-3178C6?logo=typescript&logoColor=white)](https://www.typescriptlang.org/)
 [![Tests](https://img.shields.io/badge/tests-vitest-6E9F18?logo=vitest&logoColor=white)](https://vitest.dev/)
-[![Docker](https://img.shields.io/badge/docker-ready-2496ED?logo=docker&logoColor=white)](#-docker)
+[![Docker](https://img.shields.io/badge/docker-ready-2496ED?logo=docker&logoColor=white)](#opción-b--standalone-con-docker)
+
+**Idiomas / Languages / Langues:** [Español](README.md) | [English](README.en.md) | [Français](README.fr.md)
+
+---
 
 Proxy HTTP en Node.js/TypeScript, compatible con la API de OpenAI, que se ubica entre [Karakeep](https://github.com/karakeep-app/karakeep) y varios proveedores de inferencia LLM (**Groq**, **Gemini**, **OpenRouter**, **Cloudflare Workers AI** y **Ollama**) para poder procesar un backlog masivo de bookmarks usando **solo planes gratuitos**, sin que los rate limits los marquen como fallidos.
 
@@ -28,6 +32,7 @@ Karakeep usa un LLM para taggear y resumir cada bookmark que guardás. Si el bac
 - [Configuración (variables de entorno)](#-configuración-variables-de-entorno)
 - [Endpoints](#-endpoints)
 - [Enriquecimiento de tags y taxonomía](#-enriquecimiento-de-tags-y-taxonomía-tagenricher)
+- [Investigación de especificidad y postura](#-investigación-especificidad-postura-y-estructura-de-tags)
 - [Estructura del proyecto](#-estructura-del-proyecto)
 - [Tests](#-tests)
 - [Límites de los tiers gratuitos](#-límites-sugeridos-tier-gratuito--verificar-en-cada-dashboard)
@@ -245,20 +250,39 @@ Los totales son acumulados desde que arrancó el proceso; los `recentEvents` de 
 
 Este es un módulo **opcional** pensado para mi propio caso de uso (un backlog de lectura con una taxonomía de tags curada a mano); si no te interesa, alcanza con no proveer `CANONICAL_TAGS_PATH` / `canonical_tags.json` y el proxy sigue funcionando como un proxy de failover puro.
 
-Cuando está activo, el proxy intercepta de forma transparente las solicitudes de etiquetado automático de Karakeep (`/v1/chat/completions`) e inyecta la lista maestra de tags canónicos junto con directivas de categorización:
+Cuando está activo, el proxy intercepta de forma transparente las solicitudes de etiquetado automático de Karakeep (`/v1/chat/completions`) e inyecta la lista maestra de tags canónicos junto con un schema estructurado (`response_format: json_schema`) y directivas de categorización:
 
-1. **Estructura obligatoria en 2 niveles con cupos fijos (exactamente 5 etiquetas)**
-   - **Nivel general (2 etiquetas)**: conceptos amplios tomados de la lista canónica preexistente (ej. `marxismo`, `economia`, `cine`), para catalogación y búsqueda global.
-   - **Nivel específico (3 etiquetas)**: un peldaño más concreto — sub-tema, caso de estudio, autor, país, evento o mecanismo del texto (ej. si el nivel general es `marxismo`, el específico puede ser `teoria-del-valor` o `acumulacion-por-desposesion`).
-   - El cupo fijo (2 + 3 = 5) evita que modelos chicos (Groq/Gemini Flash/Llama en Cloudflare) tomen el camino fácil y devuelvan solo categorías paraguas.
+1. **Estructura obligatoria en 2 niveles con campos fijos obligatorios**:
+   - **Nivel general (`general_1`, `general_2`)**: conceptos amplios tomados de la lista canónica preexistente (ej. `marxismo`, `economia`, `cine`), para catalogación y búsqueda global.
+   - **Nivel específico (`especifico_1` a `especifico_4`)**: descienden un peldaño conceptual respecto al nivel general — sub-tema, caso de estudio, autor, país, evento o mecanismo puntual del texto (ej. si el nivel general es `marxismo`, el específico puede ser `teoria-del-valor` o `acumulacion-por-desposesion`).
+   - El uso de **campos nombrados y requeridos** en el JSON Schema garantiza que proveedores como Groq, Gemini y OpenRouter fuercen la estructura exacta a nivel de generación de tokens (`strict: true`), evitando que los modelos tomen el camino fácil de devolver solo categorías paraguas o arrays incompletos.
 
-2. **Resolución de la contradicción "normalizar vs. detallar"**: que un concepto amplio ya exista en la lista maestra solo exime de inventar una etiqueta general redundante — nunca exime de generar las 3 etiquetas específicas de nivel 2.
+2. **Resolución de la contradicción "normalizar vs. detallar"**: que un concepto amplio ya exista en la lista maestra solo exime de inventar una etiqueta general redundante — nunca exime de generar las etiquetas específicas de nivel 2.
 
 3. **Neutralidad de postura / anti-sesgo nominal**: cada etiqueta refleja lo que el artículo efectivamente *argumenta*, en vez del sesgo estadístico típico de los LLM de asignar el nombre "neutro" del concepto a textos que lo cuestionan. Si un artículo critica un concepto (ej. filantropía, libre mercado, meritocracia), la etiqueta debe capturar esa crítica (`filantrocapitalismo`, `critica-meritocracia`) en vez del término afirmativo (`filantropia`).
 
-4. **Normalización estricta (`kebab-case`) y validación del cupo**: todas las etiquetas se fuerzan a minúsculas, separadas por guiones, sin espacios ni caracteres especiales. `sanitizeTaggingResponse()` además cuenta las etiquetas devueltas: si el modelo ignoró la regla de las 5 y devolvió de más, las trunca; si devolvió de menos, lo deja pasar mientras avisa por log — no puede reconstruir tags que el modelo nunca generó, pero al menos queda visible en los logs que el modelo no respetó el cupo.
+4. **Normalización estricta (`kebab-case`), aplanado y validación en código**:
+   - Todas las etiquetas se fuerzan a minúsculas, separadas por guiones, sin espacios ni caracteres especiales.
+   - `sanitizeTaggingResponse()` aplana los campos nombrados al formato `{"tags": [...]}` que Karakeep espera.
+   - **Validación de Criterio A en código**: el proxy verifica en código si las etiquetas específicas devueltas coinciden con algún ítem de la lista canónica y emite un `WARN` de diagnóstico si hubo colisión, sin delegar esta búsqueda en la atención del LLM.
 
 5. **Recarga en caliente**: el archivo de tags canónicos se cachea en memoria y su `mtime` se revisa cada 10 segundos, recargándose solo si cambió — sin reiniciar el contenedor.
+
+## 🔬 Investigación: especificidad, postura y estructura de tags
+
+Durante el desarrollo del proxy se llevó a cabo un proceso sistemático de investigación y experimentación para diagnosticar y resolver dos limitaciones críticas del etiquetado automático en Karakeep:
+
+1. **Sobre-generalización de etiquetas**: Tendencia sistemática de los modelos a devolver categorías paraguas excesivamente amplias (`cultura`, `marxismo`, `economia`) que no identifican los hechos, documentos o tesis singulares del artículo.
+2. **Sesgo nominal y ceguera de postura (*Stance Blindness*)**: Asignación del término nominal o "neutro" del concepto (`filantropia`) a artículos que lo critican o deconstruyen, sugiriendo erróneamente una valoración afirmativa.
+
+### Hallazgos clave y decisiones de arquitectura
+
+- **De instrucciones en prosa a `response_format` estructurado (JSON Schema)**: Los modelos (tanto pequeños como de gran escala) ignoraban con frecuencia restricciones de formato y conteo pedidas en texto libre (fenómeno respaldado por investigaciones como el paper RECAST sobre degradación con múltiples restricciones). Para resolverlo sin perder portabilidad, se diseñó un schema con **campos obligatorios nombrados** (`general_1`, `general_2`, `especifico_1..4`). Esto evita el uso de `minItems`/`maxItems` en arrays (soportado por Gemini pero rechazado por Groq/OpenAI bajo `strict: true`) y garantiza que la estructura se fuerce a nivel de decodificación de tokens en Groq, Gemini y OpenRouter.
+- **Límites del prompt engineering frente a hábitos de extracción**: Gracias a modelos con razonamiento visible (*chain-of-thought*) como `nemotron-3-super-120b`, se observó que el modelo comprendía perfectamente la regla que prohibía usar nombres propios recurrentes como específicos, pero decidía deliberadamente no aplicarla al generar la respuesta final ("but that's okay"). Esto demostró que el problema no residía en la redacción del prompt sino en la priorización interna del modelo.
+- **Traslado de validaciones del prompt al código**: Pedirle a un LLM que verifique si una etiqueta pertenece a una lista de más de 800 ítems es ineficiente y propenso a fallas silenciosas. La verificación del **Criterio A** (que las etiquetas específicas no colisionen con la lista canónica) se implementó de forma determinística en código dentro de `sanitizeTaggingResponse()`.
+- **Evaluación comparativa de modelos**: `gemini-3.5-flash` demostró ser el modelo con mejor capacidad para capturar contenido concreto de la segunda mitad de los textos (títulos exactos de documentos, mecanismos específicos), mientras que los modelos ligeros (`gpt-oss-20b`, `gemini-flash-lite`) tienden a la sobre-generalización o requieren estructuración estricta por schema.
+
+> 📖 **Informe completo de la investigación**: Para consultar el registro cronológico detallado de las 13 fases experimentales, pruebas de prompt, comparativa de modelos y literatura académica relacionada, ver [investigacion_especificidad_y_postura_tags.md](./investigacion_especificidad_y_postura_tags.md).
 
 ## 🗂️ Estructura del proyecto
 
@@ -294,7 +318,9 @@ ai-proxy/
 ├── .env.example
 ├── Dockerfile
 ├── package.json
-└── tsconfig.json
+├── tsconfig.json
+├── PROVIDER_SETUP.md                # Guía de setup y rotación de proveedores
+└── investigacion_especificidad_y_postura_tags.md # Registro e investigación de taxonomía y LLMs
 ```
 
 ## 🧪 Tests

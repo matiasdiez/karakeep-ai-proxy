@@ -32,6 +32,7 @@ Karakeep uses an LLM to tag and summarize every bookmark you save. If your backl
 - [Configuration (Environment Variables)](#-configuration-environment-variables)
 - [Endpoints](#-endpoints)
 - [Tag and Taxonomy Enrichment](#-tag-and-taxonomy-enrichment-tagenricher)
+- [Research: Specificity, Stance, and Tag Structure](#-research-tag-specificity-stance-and-structure)
 - [Project Structure](#-project-structure)
 - [Tests](#-tests)
 - [Free Tier Limits](#-suggested-limits-free-tier--verify-in-each-dashboard)
@@ -62,7 +63,7 @@ The non-trivial mechanics lie in the details of each transition:
 - **Graceful shutdown with timeout**: upon receiving `SIGTERM`/`SIGINT`, it stops accepting new connections, flushes the queue to disk, and allows up to 30s before forcing exit — preventing interrupted writes.
 - **Hot-reloading tag taxonomy**: `canonical_tags.json` is cached in memory with its `mtime` checked every 10s, allowing you to edit the tag list without restarting the proxy.
 
-This behavior is covered by tests in `src/tests/` (`rateLimiter.test.ts`, `activeHours.test.ts`, `providerManager.test.ts`, `tagEnricher.test.ts`, `handler.test.ts`), which illustrate the real runtime behavior better than any diagram.
+This behavior is covered by tests in `src/tests/` (`rateLimiter.test.ts`, `activeHours.test.ts`, `providerManager.test.ts`, `tagEnricher.test.ts`, `requestQueue.test.ts`, `metrics.test.ts`, `handler.test.ts`), which illustrate the real runtime behavior better than any diagram.
 
 ## 📋 Requirements
 
@@ -191,7 +192,7 @@ General proxy variables:
 | Method | Path | Description |
 |---|---|---|
 | `POST` | `/v1/*` | OpenAI-compatible endpoint; forwards to the active provider according to state machine |
-| `GET` | `/status` | Current status: active provider, quota usage per provider, queue size |
+| `GET` | `/status` | Current status: active provider, quota usage per provider, queue size, operational metrics |
 | `GET` | `/health` | Simple health check (`{ ok: true }`) |
 
 Example of `GET /status`:
@@ -208,28 +209,80 @@ Example of `GET /status`:
     "ollama":     { "active": false }
   },
   "queueSize": 0,
+  "metrics": {
+    "bodyRejections": {
+      "totals": { "too_large": 0, "read_timeout": 1 },
+      "recentEvents": [
+        { "timestamp": 1757400000000, "reason": "read_timeout", "elapsedMs": 30000, "limitMs": 30000 }
+      ]
+    },
+    "tagValidation": {
+      "totalsByProvider": {
+        "groq": { "ok": 128, "tooMany": 2, "tooFew": 0 },
+        "cloudflare": { "ok": 40, "tooMany": 0, "tooFew": 11 }
+      },
+      "recentEvents": [
+        { "timestamp": 1757400012000, "provider": "cloudflare", "tagCount": 3, "expected": 5 }
+      ]
+    },
+    "queuePersistence": {
+      "totals": { "success": 340, "failure": 0 },
+      "lastSuccessAt": 1757400020000,
+      "lastFailureAt": null,
+      "recentEvents": [
+        { "timestamp": 1757400020000, "ok": true, "itemCount": 2 }
+      ]
+    }
+  },
   "timestamp": "2026-09-09T12:00:00.000Z"
 }
 ```
+
+`metrics` is a separate module (`src/metrics.ts`), designed for external polling dashboards without parsing logs:
+
+- **`bodyRejections`** — how many times an incoming request was rejected due to `MAX_BODY_BYTES` (`too_large`) or `REQUEST_READ_TIMEOUT_MS` (`read_timeout`), with the last 50 events detailed (bytes received, active threshold).
+- **`tagValidation`** — per provider, how many tagging responses had exactly 5 tags (`ok`), too many (`tooMany`, truncated), or too few (`tooFew`, passed through as-is) — useful for detecting model degradation over time.
+- **`queuePersistence`** — successful vs. failed queue `persist()` calls, with timestamps for the latest of each — early warning for full or read-only disks before data loss occurs.
+
+Totals accumulate since process startup; `recentEvents` maintain a rolling window of the last 50 events (they do not grow indefinitely). All counters reset upon process restart — this is an in-memory buffer intended for periodic polling by external tools.
 
 ## 🏷️ Tag and Taxonomy Enrichment (`tagEnricher`)
 
 This is an **optional** module designed for custom workflows (a reading backlog with a hand-curated tag taxonomy); if not interested, simply omit `CANONICAL_TAGS_PATH` / `canonical_tags.json` and the proxy continues operating as a pure failover proxy.
 
-When active, the proxy transparently intercepts Karakeep's automatic tagging requests (`/v1/chat/completions`) and injects the master canonical tag list along with categorization directives:
+When active, the proxy transparently intercepts Karakeep's automatic tagging requests (`/v1/chat/completions`) and injects the master canonical tag list along with a structured schema (`response_format: json_schema`) and categorization directives:
 
-1. **Mandatory 2-tier structure with fixed quotas (exactly 5 tags)**
-   - **General level (2 tags)**: broad concepts taken from the pre-existing canonical list (e.g., `marxismo`, `economia`, `cine`), for cataloging and global search.
-   - **Specific level (3 tags)**: one step more concrete — sub-topic, case study, author, country, event, or concrete mechanism in the text (e.g., if general is `marxismo`, specific could be `teoria-del-valor` or `acumulacion-por-desposesion`).
-   - The fixed quota (2 + 3 = 5) prevents small models (Groq/Gemini Flash/Llama on Cloudflare) from taking the easy path and returning only umbrella categories.
+1. **Mandatory 2-tier structure with fixed required fields**:
+   - **General level (`general_1`, `general_2`)**: broad concepts taken from the pre-existing canonical list (e.g., `marxismo`, `economia`, `cine`), for cataloging and global search.
+   - **Specific level (`especifico_1` to `especifico_4`)**: one step more concrete — sub-topic, case study, author, country, event, or concrete mechanism analyzed in the text (e.g., if general is `marxismo`, specific could be `teoria-del-valor` or `acumulacion-por-desposesion`).
+   - Using **named required fields** in JSON Schema ensures that providers like Groq, Gemini, and OpenRouter enforce the exact structure at the token decoding level (`strict: true`), preventing models from taking the easy path of returning only umbrella categories or incomplete arrays.
 
-2. **Resolution of the "normalize vs. detail" contradiction**: the fact that a broad concept already exists in the master list only exempts the model from inventing a redundant general tag — it never exempts it from generating the 3 specific level-2 tags.
+2. **Resolution of the "normalize vs. detail" contradiction**: the fact that a broad concept already exists in the master list only exempts the model from inventing a redundant general tag — it never exempts it from generating the specific level-2 tags.
 
 3. **Stance neutrality / anti-nominal bias**: each tag reflects what the article actually *argues*, counteracting the typical statistical bias of LLMs where a nominal or "neutral" concept name is assigned to texts that critique it. If an article criticizes a concept (e.g., philanthropy, free market, meritocracy), the tag must capture that critique (`filantrocapitalismo`, `critica-meritocracia`) rather than using the affirmative term (`filantropia`).
 
-4. **Strict normalization (`kebab-case`) and quota validation**: all tags are enforced to lowercase words separated by hyphens, with no spaces or special characters. `sanitizeTaggingResponse()` also counts returned tags: if the model ignored the rule of 5 and returned too many, it truncates them; if it returned too few, it allows them through while emitting a warning log — it cannot reconstruct tags the model never generated, but at least it makes it visible in the logs that the model failed to respect the quota.
+4. **Strict normalization (`kebab-case`), flattening, and in-code validation**:
+   - All tags are enforced to lowercase words separated by hyphens, with no spaces or special characters.
+   - `sanitizeTaggingResponse()` flattens named fields back into `{"tags": [...]}` as expected by Karakeep.
+   - **In-code Criterion A validation**: the proxy programmatically checks whether returned specific tags collide with items from the canonical list and logs a diagnostic `WARN` if a collision occurs, without delegating this check to the LLM's attention.
 
 5. **Hot reload**: the canonical tags file is cached in memory and its `mtime` is checked every 10 seconds, reloading only if changed — without restarting the container.
+
+## 🔬 Research: Tag Specificity, Stance, and Structure
+
+During the development of the proxy, a systematic process of research and experimentation was carried out to diagnose and resolve two critical limitations of Karakeep's automatic tagging:
+
+1. **Tag Over-Generalization**: A systematic tendency of models to return overly broad umbrella categories (`cultura`, `marxismo`, `economia`) that fail to capture the singular facts, documents, or theses of the article.
+2. **Nominal Bias and Stance Blindness**: Assigning the nominal or "neutral" name of a concept (`filantropia`) to articles that critique or deconstruct it, misleadingly implying a favorable or affirmative appraisal.
+
+### Key Findings and Architectural Decisions
+
+- **From Prose Instructions to Structured `response_format` (JSON Schema)**: Models (both small and large scale) frequently ignored format restrictions and counts requested in free text (a phenomenon backed by academic literature such as the RECAST paper on rule degradation under multiple constraints). To solve this portably, a schema with **fixed required named fields** (`general_1`, `general_2`, `especifico_1` to `especifico_4`) was designed. This avoids using `minItems`/`maxItems` on arrays (supported by Gemini but rejected by Groq/OpenAI under `strict: true`) and guarantees that the structure is enforced at the token decoding level across Groq, Gemini, and OpenRouter.
+- **Limits of Prompt Engineering vs. Extraction Habits**: By observing models with visible reasoning (*chain-of-thought*) like `nemotron-3-super-120b`, it was revealed that the model fully understood the rule prohibiting recurring proper names as specific tags, but deliberately decided not to apply it when generating the final output ("but that's okay"). This proved that the problem was not prompt wording, but the model's internal prioritization.
+- **Moving Validations from Prompt to Code**: Asking an LLM to reliably verify whether a tag belongs to a list of over 800 items is inefficient and prone to silent failures. Verification of **Criterion A** (ensuring specific tags do not collide with the canonical list) was moved deterministically into code inside `sanitizeTaggingResponse()`.
+- **Comparative Model Evaluation**: `gemini-3.5-flash` proved to be the most capable model at capturing concrete content from the second half of texts (exact document titles, specific political/economic mechanisms), while lightweight models (`gpt-oss-20b`, `gemini-flash-lite`) tend toward over-generalization or require strict schema enforcement.
+
+> 📖 **Full Research Report**: For the detailed chronological log of all 13 experimental phases, prompt iterations, model comparisons, and relevant academic literature, see [investigacion_especificidad_y_postura_tags.md](./investigacion_especificidad_y_postura_tags.md).
 
 ## 🗂️ Project Structure
 
@@ -238,6 +291,7 @@ ai-proxy/
 ├── src/
 │   ├── config.ts                    # Reads and validates env vars
 │   ├── logger.ts                    # Logger with levels
+│   ├── metrics.ts                   # In-memory counters: body rejections, tag validation, persistence
 │   ├── index.ts                     # Entry point, Express, graceful shutdown
 │   ├── providers/
 │   │   ├── types.ts                 # Interfaces and enums
@@ -248,9 +302,9 @@ ai-proxy/
 │   │   ├── handler.ts               # Express handler + queue drainer
 │   │   └── tagEnricher.ts           # Canonical tag interceptor and injector (optional)
 │   ├── queue/
-│   │   └── requestQueue.ts          # FIFO queue with disk persistence
+│   │   └── requestQueue.ts          # FIFO queue with atomic disk persistence
 │   ├── routes/
-│   │   └── status.ts                # GET /status + GET /health
+│   │   └── status.ts                # GET /status (includes metrics) + GET /health
 │   ├── scripts/
 │   │   └── manualTagTest.ts         # Manual test script for tagEnricher
 │   └── tests/
@@ -258,11 +312,15 @@ ai-proxy/
 │       ├── activeHours.test.ts
 │       ├── providerManager.test.ts
 │       ├── tagEnricher.test.ts
+│       ├── requestQueue.test.ts
+│       ├── metrics.test.ts
 │       └── handler.test.ts          # Integration: failover, queue, body limits
 ├── .env.example
 ├── Dockerfile
 ├── package.json
-└── tsconfig.json
+├── tsconfig.json
+├── PROVIDER_SETUP.md                # Provider setup and switcher guide
+└── investigacion_especificidad_y_postura_tags.md # Tag taxonomy and LLM research report
 ```
 
 ## 🧪 Tests
@@ -273,7 +331,7 @@ pnpm test          # single run
 pnpm test:watch    # watch mode
 ```
 
-They cover rate limiting logic (sliding window RPM/TPM/TPD), active hours calculation, the `ProviderManager` state machine, tag sanitization in `tagEnricher`, and, in `handler.test.ts`, the end-to-end handler flow (failover between providers by mocking `forwardRequest`, queuing when no provider is available, and rejection of oversized request bodies).
+They cover rate limiting logic (sliding window RPM/TPM/TPD), active hours calculation, the `ProviderManager` state machine, tag sanitization in `tagEnricher`, atomic persistence in `requestQueue` (including error handling), operational counters in `metrics`, and, in `handler.test.ts`, the end-to-end handler flow (failover between providers by mocking `forwardRequest`, queuing when no provider is available, and rejection of oversized request bodies).
 
 ## 📊 Suggested Limits (Free Tier) — Verify in Each Dashboard
 

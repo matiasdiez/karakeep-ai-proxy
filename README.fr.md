@@ -32,6 +32,7 @@ Karakeep utilise un LLM pour étiqueter et résumer chaque marque-page enregistr
 - [Configuration (variables d'environnement)](#-configuration-variables-denvironnement)
 - [Points de terminaison (endpoints)](#-points-de-terminaison-endpoints)
 - [Enrichissement des tags et taxonomie](#-enrichissement-des-tags-et-taxonomie-tagenricher)
+- [Recherche : spécificité, posture et structure des étiquettes](#-recherche--spécificité-posture-et-structure-des-étiquettes)
 - [Structure du projet](#-structure-du-projet)
 - [Tests](#-tests)
 - [Limites des forfaits gratuits](#-limites-suggérées-forfaits-gratuits--à-vérifier-sur-chaque-tableau-de-bord)
@@ -62,7 +63,7 @@ La complexité se situe dans la gestion fine de chaque transition :
 - **Arrêt gracieux avec délai d'attente (graceful shutdown)** : à la réception de `SIGTERM`/`SIGINT`, le serveur cesse d'accepter de nouvelles connexions, vide la file sur le disque et accorde 30 s avant de forcer l'arrêt — évitant d'interrompre une écriture en cours.
 - **Rechargement à chaud de la taxonomie de tags** : `canonical_tags.json` est mis en cache mémoire et son horodatage `mtime` est vérifié toutes les 10 secondes, permettant de modifier la liste de tags sans redémarrer le proxy.
 
-Cette logique est couverte par les tests unitaires dans `src/tests/` (`rateLimiter.test.ts`, `activeHours.test.ts`, `providerManager.test.ts`, `tagEnricher.test.ts`, `handler.test.ts`), qui reflètent le comportement réel bien mieux que n'importe quel schéma.
+Cette logique est couverte par les tests unitaires dans `src/tests/` (`rateLimiter.test.ts`, `activeHours.test.ts`, `providerManager.test.ts`, `tagEnricher.test.ts`, `requestQueue.test.ts`, `metrics.test.ts`, `handler.test.ts`), qui reflètent le comportement réel bien mieux que n'importe quel schéma.
 
 ## 📋 Prérequis
 
@@ -191,7 +192,7 @@ Variables générales du proxy :
 | Méthode | Route | Description |
 |---|---|---|
 | `POST` | `/v1/*` | Endpoint compatible OpenAI ; redirige vers le fournisseur actif selon la machine d'états |
-| `GET` | `/status` | État actuel : fournisseur actif, consommation du quota par fournisseur, taille de la file |
+| `GET` | `/status` | État actuel : fournisseur actif, consommation du quota par fournisseur, taille de la file, métriques opérationnelles |
 | `GET` | `/health` | Vérification de santé basique (`{ ok: true }`) |
 
 Exemple de `GET /status` :
@@ -208,28 +209,80 @@ Exemple de `GET /status` :
     "ollama":     { "active": false }
   },
   "queueSize": 0,
+  "metrics": {
+    "bodyRejections": {
+      "totals": { "too_large": 0, "read_timeout": 1 },
+      "recentEvents": [
+        { "timestamp": 1757400000000, "reason": "read_timeout", "elapsedMs": 30000, "limitMs": 30000 }
+      ]
+    },
+    "tagValidation": {
+      "totalsByProvider": {
+        "groq": { "ok": 128, "tooMany": 2, "tooFew": 0 },
+        "cloudflare": { "ok": 40, "tooMany": 0, "tooFew": 11 }
+      },
+      "recentEvents": [
+        { "timestamp": 1757400012000, "provider": "cloudflare", "tagCount": 3, "expected": 5 }
+      ]
+    },
+    "queuePersistence": {
+      "totals": { "success": 340, "failure": 0 },
+      "lastSuccessAt": 1757400020000,
+      "lastFailureAt": null,
+      "recentEvents": [
+        { "timestamp": 1757400020000, "ok": true, "itemCount": 2 }
+      ]
+    }
+  },
   "timestamp": "2026-09-09T12:00:00.000Z"
 }
 ```
+
+`metrics` est un module indépendant (`src/metrics.ts`), destiné à être interrogé périodiquement par un tableau de bord sans avoir à analyser les logs :
+
+- **`bodyRejections`** — nombre de requêtes entrantes rejetées suite à `MAX_BODY_BYTES` (`too_large`) ou `REQUEST_READ_TIMEOUT_MS` (`read_timeout`), avec le détail des 50 derniers événements (octets reçus, limite active).
+- **`tagValidation`** — par fournisseur, répartition des réponses d'étiquetage ayant exactement 5 tags (`ok`), un surplus (`tooMany`, tronquées) ou un déficit (`tooFew`, transmises telles quelles) — utile pour observer une éventuelle dégradation de qualité d'un modèle.
+- **`queuePersistence`** — nombre d'opérations `persist()` de la file réussies ou échouées, avec l'horodatage des dernières occurrences — alerte précoce en cas de disque plein ou d'erreur de permissions.
+
+Les totaux sont cumulés depuis le lancement du processus ; les tableaux `recentEvents` conservent une fenêtre glissante des 50 derniers événements. L'ensemble est réinitialisé en cas de redémarrage.
 
 ## 🏷️ Enrichissement des tags et taxonomie (`tagEnricher`)
 
 Il s'agit d'un module **optionnel** pensé pour des cas d'usage spécifiques (comme un backlog d'articles avec une taxonomie de tags organisée manuellement) ; si cela ne vous est pas utile, il suffit de ne pas renseigner `CANONICAL_TAGS_PATH` / `canonical_tags.json`, et le proxy opérera simplement comme un proxy de basculement standard.
 
-Lorsqu'il est activé, le proxy intercepte en toute transparence les requêtes de marquage automatique de Karakeep (`/v1/chat/completions`) et injecte la liste maîtresse des tags canoniques avec des directives de catégorisation :
+Lorsqu'il est activé, le proxy intercepte en toute transparence les requêtes de marquage automatique de Karakeep (`/v1/chat/completions`) et injecte la liste maîtresse des tags canoniques avec un schéma structuré (`response_format: json_schema`) et des directives de catégorisation :
 
-1. **Structure obligatoire à 2 niveaux avec quotas fixes (exactement 5 étiquettes)**
-   - **Niveau général (2 étiquettes)** : concepts larges issus de la liste canonique préexistante (ex. `marxismo`, `economia`, `cine`), pour le classement et la recherche globale.
-   - **Niveau spécifique (3 étiquettes)** : un cran plus concret — sous-thème, cas d'étude, auteur, pays, événement ou mécanisme analysé dans le texte (ex. si le niveau général est `marxismo`, le niveau spécifique peut être `teoria-del-valor` ou `acumulacion-por-desposesion`).
-   - Le quota fixe (2 + 3 = 5) empêche les modèles légers (Groq/Gemini Flash/Llama sur Cloudflare) de choisir la facilité en ne retournant que des catégories parapluies.
+1. **Structure obligatoire à 2 niveaux avec champs obligatoires nommés** :
+   - **Niveau général (`general_1`, `general_2`)** : concepts larges issus de la liste canonique préexistante (ex. `marxismo`, `economia`, `cine`), pour le classement et la recherche globale.
+   - **Niveau spécifique (`especifico_1` à `especifico_4`)** : descendent d'un cran conceptuel par rapport au niveau général — sous-thème, cas d'étude, auteur, pays, événement ou mécanisme analysé dans le texte (ex. si le niveau général est `marxismo`, le spécifique peut être `teoria-del-valor` ou `acumulacion-por-desposesion`).
+   - L'usage de **champs nommés et obligatoires** dans le JSON Schema garantit que Groq, Gemini et OpenRouter imposent la structure au niveau du décodage des tokens (`strict: true`), empêchant les modèles de se limiter à des catégories parapluies ou de renvoyer des tableaux incomplets.
 
-2. **Résolution de la contradiction « normaliser vs détailler »** : le fait qu'un concept large existe déjà dans la liste maîtresse dispense uniquement d'inventer une étiquette générale redondante — cela ne dispense jamais de générer les 3 étiquettes spécifiques de niveau 2.
+2. **Résolution de la contradiction « normaliser vs détailler »** : le fait qu'un concept large existe déjà dans la liste maîtresse dispense uniquement d'inventer une étiquette générale redondante — cela ne dispense jamais de générer les étiquettes spécifiques de niveau 2.
 
 3. **Neutralité de posture / anti-biais nominal** : chaque étiquette reflète la thèse que l'article *défend réellement*, plutôt que le biais statistique habituel des LLM consistant à attribuer le terme « neutre » d'un concept à des textes qui le critiquent. Si un article critique un concept (ex. philanthropie, libre marché, méritocratie), l'étiquette doit refléter cette critique (`filantrocapitalismo`, `critica-meritocracia`) au lieu d'employer le terme affirmatif (`filantropia`).
 
-4. **Normalisation stricte (`kebab-case`) et validation du quota** : toutes les étiquettes sont obligatoirement converties en minuscules, séparées par des tirets, sans espaces ni caractères spéciaux. `sanitizeTaggingResponse()` compte également les étiquettes renvoyées : si le modèle n'a pas respecté la règle des 5 et en a retourné davantage, la liste est tronquée ; s'il en a retourné moins, la réponse est transmise tout en émettant un avertissement dans les logs — le proxy ne peut pas reconstruire des étiquettes que le modèle n'a jamais générées, mais cela met au moins en évidence dans les logs que le quota n'a pas été honoré.
+4. **Normalisation stricte (`kebab-case`), aplanissement et validation dans le code** :
+   - Toutes les étiquettes sont obligatoirement converties en minuscules, séparées par des tirets, sans espaces ni caractères spéciaux.
+   - `sanitizeTaggingResponse()` convertit les champs nommés vers le format plat `{"tags": [...]}` attendu par Karakeep.
+   - **Validation du Critère A dans le code** : le proxy vérifie directement en mémoire si les étiquettes spécifiques correspondent à des entrées de la liste canonique et émet un avertissement `WARN` de diagnostic en cas de collision, sans dépendre de l'attention du LLM.
 
 5. **Rechargement à chaud** : le fichier de tags canoniques est mis en cache mémoire et son `mtime` est inspecté toutes les 10 secondes, ne se rechargeant que s'il a changé — sans redémarrage de conteneur.
+
+## 🔬 Recherche : spécificité, posture et structure des étiquettes
+
+Au cours du développement du proxy, un processus systématique de recherche et d'expérimentation a été mené afin de diagnostiquer et corriger deux limitations majeures de l'étiquetage automatique dans Karakeep :
+
+1. **Sur-généralisation des étiquettes** : Tendance systématique des modèles à renvoyer des catégories parapluies trop larges (`cultura`, `marxismo`, `economia`) qui ne capturent pas les faits singuliers, documents ou thèses spécifiques de l'article.
+2. **Biais nominal et cécité de posture (*Stance Blindness*)** : Attribution du terme nominal ou « neutre » d'un concept (`filantropia`) à des articles qui le critiquent ou le déconstruisent, suggérant à tort une appréciation favorable.
+
+### Découvertes clés et décisions d'architecture
+
+- **Des consignes en texte brut au `response_format` structuré (JSON Schema)** : Les modèles (légers comme de grande taille) ignoraient fréquemment les contraintes de format et de quotas demandées en texte libre (phénomène corroboré par la littérature scientifique, notamment l'étude RECAST sur la dégradation du suivi d'instructions sous contraintes multiples). Pour y remédier de façon portable, un schéma comprenant des **champs obligatoires nommés** (`general_1`, `general_2`, `especifico_1` à `especifico_4`) a été conçu. Cette approche évite l'emploi de `minItems`/`maxItems` sur les tableaux (supporté par Gemini mais rejeté par Groq/OpenAI en mode `strict: true`) et garantit que la structure exacte soit imposée au niveau du décodage des tokens pour Groq, Gemini et OpenRouter.
+- **Limites de l'ingénierie de prompt face aux automatismes d'extraction** : L'observation de modèles à raisonnement visible (*chain-of-thought*) tels que `nemotron-3-super-120b` a révélé que le modèle comprenait parfaitement la consigne interdisant d'utiliser des noms propres récurrents comme étiquettes spécifiques, mais décidait délibérément de ne pas l'appliquer lors de la réponse finale (« but that's okay »). Cela a prouvé que la cause ne résidait pas dans la formulation du prompt, mais dans la hiérarchisation interne des priorités du modèle.
+- **Déplacement des vérifications du prompt vers le code** : Demander à un LLM de vérifier avec certitude si une étiquette appartient à une liste de plus de 800 entrées est inefficace et propice à des omissions silencieuses. La validation du **Critère A** (vérifier que les étiquettes spécifiques n'entrent pas en collision avec la liste canonique) a été implémentée de façon déterministe en code au sein de `sanitizeTaggingResponse()`.
+- **Évaluation comparative des modèles** : `gemini-3.5-flash` s'est imposé comme le modèle le plus performant pour capturer les éléments concrets de la seconde moitié des articles (titres exacts de documents, mécanismes politiques/économiques ciblés), tandis que les modèles légers (`gpt-oss-20b`, `gemini-flash-lite`) ont tendance à la sur-généralisation ou requièrent un strict encadrement par schéma.
+
+> 📖 **Rapport complet d'investigation** : Pour consulter le journal chronologique détaillé des 13 phases expérimentales, les itérations de prompts, la comparaison des modèles et la bibliographie académique associée, voir [investigacion_especificidad_y_postura_tags.md](./investigacion_especificidad_y_postura_tags.md).
 
 ## 🗂️ Structure du projet
 
@@ -238,6 +291,7 @@ ai-proxy/
 ├── src/
 │   ├── config.ts                    # Lecture et validation des variables d'environnement
 │   ├── logger.ts                    # Logger par niveaux
+│   ├── metrics.ts                   # Compteurs en mémoire : rejets de body, validation des tags, persistance
 │   ├── index.ts                     # Point d'entrée, Express, arrêt gracieux
 │   ├── providers/
 │   │   ├── types.ts                 # Interfaces et énumérations
@@ -248,9 +302,9 @@ ai-proxy/
 │   │   ├── handler.ts               # Gestionnaire Express + purge de la file
 │   │   └── tagEnricher.ts           # Intercepteur et injecteur de tags canoniques (optionnel)
 │   ├── queue/
-│   │   └── requestQueue.ts          # File FIFO avec persistance sur disque
+│   │   └── requestQueue.ts          # File FIFO avec persistance atomique sur disque
 │   ├── routes/
-│   │   └── status.ts                # GET /status + GET /health
+│   │   └── status.ts                # GET /status (inclut metrics) + GET /health
 │   ├── scripts/
 │   │   └── manualTagTest.ts         # Script de test manuel pour tagEnricher
 │   └── tests/
@@ -258,11 +312,15 @@ ai-proxy/
 │       ├── activeHours.test.ts
 │       ├── providerManager.test.ts
 │       ├── tagEnricher.test.ts
+│       ├── requestQueue.test.ts
+│       ├── metrics.test.ts
 │       └── handler.test.ts          # Intégration : basculement, file d'attente, limites du corps de requête
 ├── .env.example
 ├── Dockerfile
 ├── package.json
-└── tsconfig.json
+├── tsconfig.json
+├── PROVIDER_SETUP.md                # Guide de configuration et rotation des fournisseurs
+└── investigacion_especificidad_y_postura_tags.md # Rapport de recherche sur la taxonomie et les LLMs
 ```
 
 ## 🧪 Tests
@@ -273,7 +331,7 @@ pnpm test          # exécution unique
 pnpm test:watch    # mode interactif watch
 ```
 
-Ils couvrent la logique de limitation de débit (fenêtre glissante RPM/TPM/TPD), le calcul des heures d'activité, la machine d'états de `ProviderManager`, le nettoyage des tags dans `tagEnricher` et, dans `handler.test.ts`, le cycle complet du gestionnaire de requêtes (basculement entre fournisseurs avec simulation de `forwardRequest`, mise en file d'attente lorsqu'aucun fournisseur n'est disponible et rejet des corps de requête surdimensionnés).
+Ils couvrent la logique de limitation de débit (fenêtre glissante RPM/TPM/TPD), le calcul des heures d'activité, la machine d'états de `ProviderManager`, le nettoyage des tags dans `tagEnricher`, la persistance atomique dans `requestQueue` (y compris la gestion d'erreurs), les compteurs de `metrics` et, dans `handler.test.ts`, le cycle complet du gestionnaire de requêtes (basculement entre fournisseurs avec simulation de `forwardRequest`, mise en file d'attente lorsqu'aucun fournisseur n'est disponible et rejet des corps de requête surdimensionnés).
 
 ## 📊 Limites suggérées (forfaits gratuits) — à vérifier sur chaque tableau de bord
 
