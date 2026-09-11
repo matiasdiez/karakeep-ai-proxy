@@ -112,11 +112,6 @@ export const TAGGING_RESPONSE_SCHEMA = {
   description:
     'Etiquetas para un artículo guardado en un sistema de bookmarking. ' +
     'IDIOMA: todos los valores deben estar en ESPAÑOL, sin excepción — nunca en inglés, aunque el artículo o tu razonamiento interno estén en inglés. ' +
-    'DOS CRITERIOS PARA especifico_1/2/3 — los dos tienen que pasar, no alcanza con uno solo: ' +
-    'CRITERIO A (mecánico): el valor NO puede estar en la lista maestra de tags canónicos. ' +
-    'CRITERIO B (el que realmente importa — pasar A no significa pasar B): aunque el valor NO esté en la lista maestra, si igual es un tema recurrente que aparecería en decenas de notas distintas sobre este mismo asunto — un político mientras está en el centro de la escena, un partido, un país, una política macro en curso mientras dura (ej. "dolarizacion" durante toda una gestión) — SIGUE sin ser específico. Que no esté literalmente en la lista NO lo vuelve específico por sí solo. Específico es el caso, documento, cifra, medida o hecho puntual de ESTA nota que no se repetiría en la cobertura genérica del mismo tema. ' +
-    'AUTO-VERIFICACIÓN OBLIGATORIA: antes de responder, releé especifico_1, especifico_2 y especifico_3 uno por uno contra el CRITERIO B. Si en esa relectura notás que alguno lo viola — aunque ya lo hayas escrito, aunque ya hayas razonado sobre él antes — reemplazalo antes de responder. Notar la violación y dejarla pasar igual es un error. ' +
-    'REGLA ANTI-REUTILIZACIÓN adicional: un campo específico tampoco puede ser intercambiable con general_1/general_2 sin perder información — si serviría igual como general, no es específico. ' +
     'Regla de postura: si el artículo critica o cuestiona un concepto (ej. filantropía, meritocracia, libre mercado), ' +
     'la etiqueta debe reflejar esa crítica (ej. "critica-meritocracia", o un término ya reconocido como "filantrocapitalismo") ' +
     'en vez del nombre neutro del concepto, que sugiere implícitamente una mirada favorable. ' +
@@ -136,20 +131,24 @@ export const TAGGING_RESPONSE_SCHEMA = {
     especifico_1: {
       type: 'string',
       description:
-        'Etiqueta específica 1, EN ESPAÑOL (traducila si el término te sale en inglés): el sub-tema, caso, documento, cifra o mecanismo CONCRETO del artículo — el que NO se repetiría en otra nota sobre el mismo tema general. ' +
-        'Aplicá CRITERIO A y CRITERIO B (ver arriba) y hacé la AUTO-VERIFICACIÓN antes de responder.',
+        'Etiqueta específica 1, EN ESPAÑOL (traducila si el término te sale en inglés): el sub-tema, caso, documento, autor o mecanismo CONCRETO del artículo. ' +
+        'Test de unicidad: si esta etiqueta serviría igual para decenas de artículos distintos sobre el mismo tema general ' +
+        '— incluso si es un nombre propio o institución recurrente — NO es específica; buscá el hecho puntual de esta nota en particular.',
     },
     especifico_2: {
       type: 'string',
-
       description: 'Etiqueta específica 2, EN ESPAÑOL: mismo criterio que especifico_1, un ángulo CONCRETO distinto del artículo.',
     },
     especifico_3: {
       type: 'string',
       description: 'Etiqueta específica 3, EN ESPAÑOL: mismo criterio, un tercer ángulo CONCRETO distinto a los dos anteriores.',
     },
+    especifico_4: {
+      type: 'string',
+      description: 'Etiqueta específica 4, EN ESPAÑOL: mismo criterio, un cuarto ángulo CONCRETO distinto a los tres anteriores.',
+    },
   },
-  required: ['general_1', 'general_2', 'especifico_1', 'especifico_2', 'especifico_3'],
+  required: ['general_1', 'general_2', 'especifico_1', 'especifico_2', 'especifico_3', 'especifico_4'],
   additionalProperties: false,
 } as const;
 
@@ -243,7 +242,7 @@ La estructura exacta de campos (2 generales + 3 específicos) y la regla de neut
  * lo deja pasar sin tocar.
  */
 function normalizeStructuredTagFields(parsedContent: Record<string, unknown>): string[] | null {
-  const fieldOrder = ['general_1', 'general_2', 'especifico_1', 'especifico_2', 'especifico_3'];
+  const fieldOrder = ['general_1', 'general_2', 'especifico_1', 'especifico_2', 'especifico_3', 'especifico_4'];
   if (!fieldOrder.every((f) => typeof parsedContent[f] === 'string')) {
     return null;
   }
@@ -252,8 +251,12 @@ function normalizeStructuredTagFields(parsedContent: Record<string, unknown>): s
 
 /**
  * Sanitizes LLM response content to ensure all tags in {"tags": [...]} are strictly in kebab-case.
+ * Además, cuando el shape es el estructurado (5 campos), valida en código el CRITERIO A
+ * (¿el valor específico está en la lista maestra?) en vez de confiar en que el LLM haya
+ * escaneado bien una lista de cientos de tags — eso falla en silencio con listas largas
+ * (ver canonical_tags.json real: 804 entradas), así que lo chequeamos acá con certeza.
  */
-export function sanitizeTaggingResponse(responseBuffer: Buffer): Buffer {
+export function sanitizeTaggingResponse(responseBuffer: Buffer, customTagsPath?: string): Buffer {
   if (responseBuffer.length === 0) return responseBuffer;
 
   let body: Record<string, unknown>;
@@ -268,6 +271,7 @@ export function sanitizeTaggingResponse(responseBuffer: Buffer): Buffer {
   }
 
   let modified = false;
+  const canonicalSet = new Set(loadCanonicalTags(customTagsPath).map(normalizeToKebab));
 
   for (const choice of body['choices'] as Array<{ message?: { role?: string; content?: unknown } }>) {
     if (typeof choice?.message?.content === 'string') {
@@ -285,6 +289,18 @@ export function sanitizeTaggingResponse(responseBuffer: Buffer): Buffer {
               .filter((t: unknown): t is string => typeof t === 'string' && t.trim().length > 0)
               .map(normalizeToKebab)
               .filter((t: string) => t.length > 0);
+
+            // Validación programática del CRITERIO A: si esto vino del shape estructurado,
+            // las posiciones 2-4 son especifico_1/2/3 — no deberían estar en la lista maestra.
+            if (structuredTags && canonicalSet.size > 0) {
+              const especificos = sanitizedTags.slice(2);
+              const violaciones = especificos.filter((tag: string) => canonicalSet.has(tag));
+              if (violaciones.length > 0) {
+                logger.warn(
+                  `CRITERIO A violado (en código, no por el modelo): las etiquetas específicas [${violaciones.join(', ')}] están en la lista canónica — el modelo no las detectó. Quedan igual en la respuesta por ahora, esto solo loguea para diagnóstico.`
+                );
+              }
+            }
 
             // Siempre devolvemos {"tags": [...]} — es lo único que Karakeep sabe leer,
             // sin importar si el proveedor devolvió el shape de 5 campos o el viejo array.

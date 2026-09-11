@@ -46,6 +46,7 @@ export interface ProxyConfig {
   port: number;
 
   groq: {
+    enabled: boolean;
     apiKey: string;
     baseUrl: string;
     model: string;
@@ -56,6 +57,7 @@ export interface ProxyConfig {
   };
 
   gemini: {
+    enabled: boolean;
     apiKey: string;
     baseUrl: string;
     model: string;
@@ -66,6 +68,7 @@ export interface ProxyConfig {
   };
 
   openrouter: {
+    enabled: boolean;
     apiKey: string;
     baseUrl: string;
     model: string;
@@ -74,6 +77,7 @@ export interface ProxyConfig {
   };
 
   cloudflare: {
+    enabled: boolean;
     apiToken: string;
     accountId: string;
     baseUrl: string;
@@ -122,6 +126,7 @@ export function loadConfig(): ProxyConfig {
     port: optionalInt('PROXY_PORT', 8080),
 
     groq: {
+      enabled: process.env['GROQ_ENABLED'] !== 'false',
       apiKey: requireEnvIfUsed('groq', providerOrder, 'GROQ_API_KEY'),
       baseUrl: optionalEnv('GROQ_BASE_URL', 'https://api.groq.com/openai/v1'),
       model: optionalEnv('GROQ_MODEL', 'openai/gpt-oss-20b'),
@@ -132,6 +137,7 @@ export function loadConfig(): ProxyConfig {
     },
 
     gemini: {
+      enabled: process.env['GEMINI_ENABLED'] !== 'false',
       apiKey: requireEnvIfUsed('gemini', providerOrder, 'GEMINI_API_KEY'),
       baseUrl: optionalEnv('GEMINI_BASE_URL', 'https://generativelanguage.googleapis.com/v1beta/openai'),
       model: optionalEnv('GEMINI_MODEL', 'gemini-flash-lite-latest'),
@@ -142,6 +148,7 @@ export function loadConfig(): ProxyConfig {
     },
 
     openrouter: {
+      enabled: process.env['OPENROUTER_ENABLED'] !== 'false',
       apiKey: requireEnvIfUsed('openrouter', providerOrder, 'OPENROUTER_API_KEY'),
       baseUrl: optionalEnv('OPENROUTER_BASE_URL', 'https://openrouter.ai/api/v1'),
       model: optionalEnv('OPENROUTER_MODEL', 'nvidia/nemotron-3-super-120b-a12b:free'),
@@ -150,6 +157,7 @@ export function loadConfig(): ProxyConfig {
     },
 
     cloudflare: {
+      enabled: process.env['CLOUDFLARE_ENABLED'] !== 'false',
       apiToken: requireEnvIfUsed('cloudflare', providerOrder, 'CLOUDFLARE_API_TOKEN'),
       accountId: requireEnvIfUsed('cloudflare', providerOrder, 'CLOUDFLARE_ACCOUNT_ID'),
       baseUrl: optionalEnv('CLOUDFLARE_BASE_URL', 'https://api.cloudflare.com/client/v4/accounts'),

@@ -2,6 +2,8 @@ import { ProxyConfig } from '../config.js';
 import { createLogger } from '../logger.js';
 import { ProviderName, ProviderStats } from './types.js';
 import { RateLimiter } from './rateLimiter.js';
+import fs from 'fs';
+import path from 'path';
 
 const logger = createLogger('ProviderManager');
 
@@ -12,20 +14,9 @@ export interface ActiveProvider {
   model: string;
 }
 
-/**
- * State machine managing which provider is currently active.
- *
- * Priority / fallback order (during active hours):
- *   providerOrder[0] → providerOrder[1] → ... → WAITING (queue)
- *
- * "Active hours" are the configured daytime window (ACTIVE_HOURS_START–
- * ACTIVE_HOURS_END). Outside that window, if Ollama is enabled, it's used
- * directly — the cloud cascade above is skipped entirely so free-tier quota
- * is preserved for daytime traffic. If Ollama is disabled, the cloud cascade
- * runs regardless of time of day.
- */
 export class ProviderManager {
   private readonly config: ProxyConfig;
+  private sharedConfig: Record<string, boolean> = {};
 
   private readonly groqLimiter: RateLimiter;
   private readonly geminiLimiter: RateLimiter;
@@ -35,7 +26,6 @@ export class ProviderManager {
   private groqExhausted = false;
   private geminiExhausted = false;
 
-  /** Timestamp when each provider was marked exhausted (for logging) */
   private groqExhaustedAt: number | null = null;
   private geminiExhaustedAt: number | null = null;
 
@@ -46,6 +36,17 @@ export class ProviderManager {
 
   constructor(config: ProxyConfig) {
     this.config = config;
+
+    // Initialize shared config defaults
+    this.sharedConfig = {
+      groq: config.groq.enabled,
+      gemini: config.gemini.enabled,
+      openrouter: config.openrouter.enabled,
+      cloudflare: config.cloudflare.enabled,
+      ollama: config.enableOllama,
+    };
+
+    this.initSharedConfig();
 
     this.groqLimiter = new RateLimiter(
       config.groq.rateLimitRpm,
@@ -65,19 +66,51 @@ export class ProviderManager {
 
     this.openrouterLimiter = new RateLimiter(
       config.openrouter?.rateLimitRpm ?? 20,
-      0, // no tpm limit
-      0, // no tpd limit
+      0,
+      0,
       config.exhaustionThreshold,
       config.openrouter?.rateLimitRpd ?? 50,
     );
 
     this.cloudflareLimiter = new RateLimiter(
       config.cloudflare?.rateLimitRpm ?? 300,
-      0, // no tpm limit
-      config.cloudflare?.rateLimitTpd ?? 10000, // daily neuron limit in TPD position
+      0,
+      config.cloudflare?.rateLimitTpd ?? 10000,
       config.exhaustionThreshold,
-      0, // no rpd limit
+      0,
     );
+  }
+
+  private initSharedConfig() {
+    const sharedConfigPath = '/app/data/shared_config.json';
+    try {
+      if (fs.existsSync(sharedConfigPath)) {
+        const data = JSON.parse(fs.readFileSync(sharedConfigPath, 'utf8'));
+        this.sharedConfig = { ...this.sharedConfig, ...data };
+      } else {
+        // Create dir if doesn't exist just in case, though /app/data is mounted
+        if (!fs.existsSync('/app/data')) fs.mkdirSync('/app/data', { recursive: true });
+        fs.writeFileSync(sharedConfigPath, JSON.stringify(this.sharedConfig, null, 2));
+      }
+
+      fs.watchFile(sharedConfigPath, { interval: 1000 }, () => {
+        try {
+          if (fs.existsSync(sharedConfigPath)) {
+            const data = JSON.parse(fs.readFileSync(sharedConfigPath, 'utf8'));
+            this.sharedConfig = { ...this.sharedConfig, ...data };
+            logger.info('Shared config reloaded via hot-reload', this.sharedConfig);
+          }
+        } catch (e) {
+          logger.error('Error reloading shared config', e);
+        }
+      });
+    } catch (e) {
+      logger.error('Error setting up shared_config.json watcher', e);
+    }
+  }
+
+  private isProviderEnabled(provider: string): boolean {
+    return this.sharedConfig[provider] ?? false;
   }
 
   // ── Public API ──────────────────────────────────────────────────────────────
@@ -90,13 +123,13 @@ export class ProviderManager {
     // Outside active hours, prefer Ollama directly — this is the whole point
     // of having a local fallback: save cloud free-tier quota for daytime use
     // instead of burning through it overnight just because it's available.
-    if (!this.isInActiveHours() && this.config.enableOllama) {
+    if (!this.isInActiveHours() && this.isProviderEnabled('ollama')) {
       return this.ollamaProvider();
     }
 
     // Try cloud providers in priority order
     for (const provider of this.config.providerOrder) {
-      if (provider === 'groq' && !this.groqExhausted && this.groqLimiter.canSend(tokenEstimate)) {
+      if (provider === 'groq' && this.isProviderEnabled('groq') && !this.groqExhausted && this.groqLimiter.canSend(tokenEstimate)) {
         return {
           name: ProviderName.GROQ,
           baseUrl: this.config.groq.baseUrl,
@@ -105,7 +138,7 @@ export class ProviderManager {
         };
       }
       
-      if (provider === 'gemini' && !this.geminiExhausted && this.geminiLimiter.canSend(tokenEstimate)) {
+      if (provider === 'gemini' && this.isProviderEnabled('gemini') && !this.geminiExhausted && this.geminiLimiter.canSend(tokenEstimate)) {
         return {
           name: ProviderName.GEMINI,
           baseUrl: this.config.gemini.baseUrl,
@@ -114,7 +147,7 @@ export class ProviderManager {
         };
       }
       
-      if (provider === 'openrouter' && !this.openrouterExhausted && this.openrouterLimiter.canSend(tokenEstimate)) {
+      if (provider === 'openrouter' && this.isProviderEnabled('openrouter') && !this.openrouterExhausted && this.openrouterLimiter.canSend(tokenEstimate)) {
         return {
           name: ProviderName.OPENROUTER,
           baseUrl: this.config.openrouter.baseUrl,
@@ -123,7 +156,7 @@ export class ProviderManager {
         };
       }
       
-      if (provider === 'cloudflare' && !this.cloudflareExhausted && this.cloudflareLimiter.canSend(tokenEstimate)) {
+      if (provider === 'cloudflare' && this.isProviderEnabled('cloudflare') && !this.cloudflareExhausted && this.cloudflareLimiter.canSend(tokenEstimate)) {
         const base = this.config.cloudflare.baseUrl.replace(/\/$/, '');
         const fullBaseUrl = base.includes(this.config.cloudflare.accountId)
           ? base
@@ -139,7 +172,7 @@ export class ProviderManager {
     }
 
     // All cloud providers exhausted. Check if Ollama is enabled
-    if (this.config.enableOllama) {
+    if (this.isProviderEnabled('ollama')) {
       return this.ollamaProvider();
     }
 
@@ -290,26 +323,26 @@ export class ProviderManager {
     const cloudflareStats = this.cloudflareLimiter.getStats();
 
     let activeProvider = 'WAITING';
-    if (!activeHours && this.config.enableOllama) {
+    if (!activeHours && this.isProviderEnabled('ollama')) {
       activeProvider = 'OLLAMA';
     } else {
       for (const provider of this.config.providerOrder) {
-        if (provider === 'groq' && !this.groqExhausted && this.groqLimiter.canSend(0)) {
+        if (provider === 'groq' && this.isProviderEnabled('groq') && !this.groqExhausted && this.groqLimiter.canSend(0)) {
           activeProvider = 'GROQ';
           break;
-        } else if (provider === 'gemini' && !this.geminiExhausted && this.geminiLimiter.canSend(0)) {
+        } else if (provider === 'gemini' && this.isProviderEnabled('gemini') && !this.geminiExhausted && this.geminiLimiter.canSend(0)) {
           activeProvider = 'GEMINI';
           break;
-        } else if (provider === 'openrouter' && !this.openrouterExhausted && this.openrouterLimiter.canSend(0)) {
+        } else if (provider === 'openrouter' && this.isProviderEnabled('openrouter') && !this.openrouterExhausted && this.openrouterLimiter.canSend(0)) {
           activeProvider = 'OPENROUTER';
           break;
-        } else if (provider === 'cloudflare' && !this.cloudflareExhausted && this.cloudflareLimiter.canSend(0)) {
+        } else if (provider === 'cloudflare' && this.isProviderEnabled('cloudflare') && !this.cloudflareExhausted && this.cloudflareLimiter.canSend(0)) {
           activeProvider = 'CLOUDFLARE';
           break;
         }
       }
 
-      if (activeProvider === 'WAITING' && this.config.enableOllama) {
+      if (activeProvider === 'WAITING' && this.isProviderEnabled('ollama')) {
         activeProvider = 'OLLAMA';
       }
     }
@@ -356,7 +389,7 @@ export class ProviderManager {
         },
         ollama: {
           name: ProviderName.OLLAMA,
-          active: this.config.enableOllama,
+          active: this.isProviderEnabled('ollama'),
         },
       },
     };

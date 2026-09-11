@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import fs from 'fs';
 import path from 'path';
 import os from 'os';
@@ -121,7 +121,14 @@ describe('TagEnricher', () => {
     expect(parsed.response_format.json_schema.strict).toBe(true);
 
     const schema = parsed.response_format.json_schema.schema;
-    expect(schema.required).toEqual(['general_1', 'general_2', 'especifico_1', 'especifico_2', 'especifico_3']);
+    expect(schema.required).toEqual([
+      'general_1',
+      'general_2',
+      'especifico_1',
+      'especifico_2',
+      'especifico_3',
+      'especifico_4',
+    ]);
     expect(schema.additionalProperties).toBe(false);
 
     // Regla de neutralidad de postura vive en la descripción del schema, no en el rulesText
@@ -130,14 +137,12 @@ describe('TagEnricher', () => {
     // Regla de "no repetir el mismo eje" (ej. argentina / politica-argentina) vive en general_2
     expect(schema.properties.general_2.description).toContain('mismo eje');
 
-    // Regla de unicidad ahora dividida en 2 criterios (mecánico vs. semántico) + auto-verificación
-    expect(schema.description).toContain('CRITERIO A');
-    expect(schema.description).toContain('CRITERIO B');
-    expect(schema.description).toContain('AUTO-VERIFICACIÓN OBLIGATORIA');
-    expect(schema.properties.especifico_1.description).toContain('CRITERIO A');
+    // Test de unicidad vive en la descripción de especifico_1
+    expect(schema.properties.especifico_1.description).toContain('Test de unicidad');
 
-    // Regla anti-reutilización: un valor específico no puede coincidir con lo que serviría como general
-    expect(schema.description).toContain('REGLA ANTI-REUTILIZACIÓN');
+    // especifico_4 nuevo, mismo criterio que los demás
+    expect(schema.properties.especifico_4).toBeDefined();
+    expect(schema.properties.especifico_4.description).toContain('cuarto ángulo');
   });
 
   it('leaves non-tagging payload buffers completely untouched', () => {
@@ -169,7 +174,7 @@ describe('TagEnricher', () => {
   });
 
   describe('sanitizeTaggingResponse', () => {
-    it('flattens the structured 5-field response shape into {"tags": [...]} in kebab-case', () => {
+    it('flattens the structured 6-field response shape into {"tags": [...]} in kebab-case', () => {
       const llmResponse = {
         choices: [
           {
@@ -181,6 +186,7 @@ describe('TagEnricher', () => {
                 especifico_1: 'Ley Ómnibus',
                 especifico_2: '  fondo sojero ',
                 especifico_3: 'Máximo Kirchner',
+                especifico_4: 'Instituto Patria',
               }),
             },
           },
@@ -193,10 +199,42 @@ describe('TagEnricher', () => {
       const parsed = JSON.parse(sanitized.toString('utf-8'));
       const parsedContent = JSON.parse(parsed.choices[0].message.content);
 
-      // Karakeep solo sabe leer {"tags": [...]} — el shape de 5 campos nunca debe llegarle
+      // Karakeep solo sabe leer {"tags": [...]} — el shape de 6 campos nunca debe llegarle
       expect(parsedContent).toEqual({
-        tags: ['politica-argentina', 'economía', 'ley-ómnibus', 'fondo-sojero', 'máximo-kirchner'],
+        tags: ['politica-argentina', 'economía', 'ley-ómnibus', 'fondo-sojero', 'máximo-kirchner', 'instituto-patria'],
       });
+    });
+
+    it('detects in code when a specific field violates CRITERIO A (matches the canonical list) even though the model missed it', () => {
+      const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+      const llmResponse = {
+        choices: [
+          {
+            message: {
+              role: 'assistant',
+              // El modelo puso "economia" (que SÍ está en tempTagsPath) como específico — CRITERIO A violado
+              content: JSON.stringify({
+                general_1: 'politica',
+                general_2: 'marxismo',
+                especifico_1: 'economia',
+                especifico_2: 'ley-omnibus',
+                especifico_3: 'fondo-sojero',
+                especifico_4: 'instituto-patria',
+              }),
+            },
+          },
+        ],
+      };
+
+      const buffer = Buffer.from(JSON.stringify(llmResponse), 'utf-8');
+      sanitizeTaggingResponse(buffer, tempTagsPath);
+
+      const warnedText = warnSpy.mock.calls.map((call) => call.join(' ')).join('\n');
+      expect(warnedText).toContain('CRITERIO A violado');
+      expect(warnedText).toContain('economia');
+
+      warnSpy.mockRestore();
     });
 
     it('sanitizes tags in LLM JSON response to strict kebab-case', () => {
