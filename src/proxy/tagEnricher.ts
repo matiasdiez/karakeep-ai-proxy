@@ -99,6 +99,69 @@ export function isKarakeepTaggingRequest(body: Record<string, unknown>): boolean
 }
 
 /**
+ * JSON Schema para forzar el conteo exacto de etiquetas a nivel de generación
+ * estructurada, en vez de depender de una instrucción en prosa que los modelos
+ * (chicos y grandes) vienen ignorando de forma consistente. 5 campos NOMBRADOS
+ * y `required` en vez de un array con minItems/maxItems, porque minItems/maxItems
+ * en arrays NO está soportado por el subconjunto de JSON Schema que usa Groq/OpenAI
+ * en modo `strict: true` (sí lo soporta Gemini, pero no de forma pareja entre
+ * proveedores) — objetos con propiedades fijas sí es portable entre ambos.
+ */
+export const TAGGING_RESPONSE_SCHEMA = {
+  type: 'object',
+  description:
+    'Etiquetas para un artículo guardado en un sistema de bookmarking. ' +
+    'IDIOMA: todos los valores deben estar en ESPAÑOL, sin excepción — nunca en inglés, aunque el artículo o tu razonamiento interno estén en inglés. ' +
+    'DOS CRITERIOS PARA especifico_1/2/3 — los dos tienen que pasar, no alcanza con uno solo: ' +
+    'CRITERIO A (mecánico): el valor NO puede estar en la lista maestra de tags canónicos. ' +
+    'CRITERIO B (el que realmente importa — pasar A no significa pasar B): aunque el valor NO esté en la lista maestra, si igual es un tema recurrente que aparecería en decenas de notas distintas sobre este mismo asunto — un político mientras está en el centro de la escena, un partido, un país, una política macro en curso mientras dura (ej. "dolarizacion" durante toda una gestión) — SIGUE sin ser específico. Que no esté literalmente en la lista NO lo vuelve específico por sí solo. Específico es el caso, documento, cifra, medida o hecho puntual de ESTA nota que no se repetiría en la cobertura genérica del mismo tema. ' +
+    'AUTO-VERIFICACIÓN OBLIGATORIA: antes de responder, releé especifico_1, especifico_2 y especifico_3 uno por uno contra el CRITERIO B. Si en esa relectura notás que alguno lo viola — aunque ya lo hayas escrito, aunque ya hayas razonado sobre él antes — reemplazalo antes de responder. Notar la violación y dejarla pasar igual es un error. ' +
+    'REGLA ANTI-REUTILIZACIÓN adicional: un campo específico tampoco puede ser intercambiable con general_1/general_2 sin perder información — si serviría igual como general, no es específico. ' +
+    'Regla de postura: si el artículo critica o cuestiona un concepto (ej. filantropía, meritocracia, libre mercado), ' +
+    'la etiqueta debe reflejar esa crítica (ej. "critica-meritocracia", o un término ya reconocido como "filantrocapitalismo") ' +
+    'en vez del nombre neutro del concepto, que sugiere implícitamente una mirada favorable. ' +
+    'No asumas la postura ideológica más común o "por defecto" sobre un tema: etiquetá según lo que el texto efectivamente argumenta.',
+  properties: {
+    general_1: {
+      type: 'string',
+      description:
+        'Etiqueta general 1, EN ESPAÑOL: de la lista maestra de tags canónicos provista en el prompt, el concepto amplio que mejor resume el tema del artículo.',
+    },
+    general_2: {
+      type: 'string',
+      description:
+        'Etiqueta general 2, EN ESPAÑOL: de la lista maestra, sobre un EJE DISTINTO al de general_1 — no repitas el mismo concepto con otra redacción ' +
+        '(ej. "argentina" y "politica-argentina" cuentan como el mismo eje, no como dos ejes distintos).',
+    },
+    especifico_1: {
+      type: 'string',
+      description:
+        'Etiqueta específica 1, EN ESPAÑOL (traducila si el término te sale en inglés): el sub-tema, caso, documento, cifra o mecanismo CONCRETO del artículo — el que NO se repetiría en otra nota sobre el mismo tema general. ' +
+        'Aplicá CRITERIO A y CRITERIO B (ver arriba) y hacé la AUTO-VERIFICACIÓN antes de responder.',
+    },
+    especifico_2: {
+      type: 'string',
+
+      description: 'Etiqueta específica 2, EN ESPAÑOL: mismo criterio que especifico_1, un ángulo CONCRETO distinto del artículo.',
+    },
+    especifico_3: {
+      type: 'string',
+      description: 'Etiqueta específica 3, EN ESPAÑOL: mismo criterio, un tercer ángulo CONCRETO distinto a los dos anteriores.',
+    },
+  },
+  required: ['general_1', 'general_2', 'especifico_1', 'especifico_2', 'especifico_3'],
+  additionalProperties: false,
+} as const;
+
+/**
+ * Providers cuyo soporte de `response_format: json_schema` con `strict: true`
+ * está confirmado (Groq y Gemini). Para el resto (Cloudflare, Ollama) no hay
+ * garantía documentada pareja, así que forwardRequest.ts lo retira del body
+ * antes de reenviar y esos proveedores siguen dependiendo solo del rulesText.
+ */
+export const STRUCTURED_OUTPUT_SUPPORTED_PROVIDERS = new Set(['groq', 'gemini', 'openrouter']);
+
+/**
  * Injects the canonical tags and strict anti-fragmentation rules into Karakeep's tagging prompt.
  */
 export function enrichTaggingRequest(bodyBuffer: Buffer, customTagsPath?: string): Buffer {
@@ -128,14 +191,13 @@ A continuación se proporciona la lista maestra de etiquetas consolidadas y pref
 [${tagsListStr}]
 
 REGLAS ESTRICTAS DE ETIQUETADO:
-1. Debes priorizar SIEMPRE seleccionar etiquetas de esta lista maestra si coinciden conceptual o temáticamente con el artículo.
-2. Está estrictamente PROHIBIDO inventar sinónimos o variantes léxicas (ej. plurales o términos en inglés) si ya existe un concepto equivalente en la lista.
-3. ESTRUCTURA EN 2 NIVELES OBLIGATORIA — devolvé exactamente 5 etiquetas en total:
-   - NIVEL GENERAL (exactamente 2 etiquetas): elegí de la lista maestra los conceptos amplios que coincidan con el tema del artículo.
-   - NIVEL ESPECÍFICO (exactamente 3 etiquetas): generá etiquetas que bajen un peldaño conceptual respecto al nivel general, nombrando el sub-tema, caso, autor, país, evento o mecanismo CONCRETO del artículo (ej.: si el nivel general es "marxismo", el nivel específico podría ser "teoria-del-valor" o "debate-partido-sindicato", según lo que el texto realmente trate). Que un concepto más amplio ya exista en la lista maestra (ver regla 1) SOLO te exime de inventar una etiqueta general redundante — nunca te exime de generar las 3 etiquetas específicas del nivel 2.
-   - TEST DE UNICIDAD para el nivel específico: antes de asignar cada etiqueta específica, evaluá si serviría igual para decenas de artículos distintos sobre el mismo tema general — incluso si es un nombre propio, institución o país que aparece recurrentemente en ese tipo de cobertura. Si la respuesta es sí, esa etiqueta es de nivel general, no específico; usá en cambio el hecho, documento, mecanismo o hallazgo puntual que hace única a esta nota en particular.
-4. FORMATO OBLIGATORIO: Todas las etiquetas deben estar en minúsculas y usar SIEMPRE guiones entre palabras (kebab-case, por ejemplo: 'politica-nacional', 'diseño-web'). Está estrictamente PROHIBIDO usar espacios en las etiquetas.
-5. NEUTRALIDAD DE POSTURA: cada etiqueta (general o específica) debe reflejar lo que el artículo efectivamente ARGUMENTA, no el nombre "neutro" por defecto del tema. Un artículo puede tratar un concepto (ej. filantropía, libre mercado, meritocracia) para CRITICARLO o CUESTIONARLO, no para promoverlo. En esos casos usá una etiqueta que lo indique — ya sea un término específico ya reconocido para esa crítica (ej. "filantrocapitalismo") o una etiqueta descriptiva ("critica-meritocracia") — en vez de solo el nombre del concepto, que sugiere implícitamente una mirada favorable. No asumas la postura ideológica más común o "por defecto" sobre un tema: etiquetá según la posición real del texto, sea cual sea.
+1. IDIOMA OBLIGATORIO: absolutamente todas las etiquetas deben estar escritas en ESPAÑOL. Está PROHIBIDO usar inglés, incluso para conceptos que te resulten más naturales en inglés (ej. "dolarizacion", NUNCA "dollarization"; "deuda-publica", NUNCA "public debt"). Si el artículo está en español (como en este caso), no hay ninguna razón para responder en otro idioma.
+2. Debes priorizar SIEMPRE seleccionar etiquetas de esta lista maestra si coinciden conceptual o temáticamente con el artículo, para los campos de nivel general (general_1, general_2).
+3. Está estrictamente PROHIBIDO inventar sinónimos o variantes léxicas (ej. plurales o términos en inglés) si ya existe un concepto equivalente en la lista.
+4. Los campos específicos (especifico_1, especifico_2, especifico_3) NO tienen que salir de la lista maestra — al contrario, deben bajar un peldaño conceptual respecto al nivel general y nombrar el sub-tema, caso, autor, país, evento o mecanismo CONCRETO del artículo.
+5. FORMATO OBLIGATORIO: Todas las etiquetas deben estar en minúsculas y usar SIEMPRE guiones entre palabras (kebab-case, por ejemplo: 'politica-nacional', 'diseño-web'). Está estrictamente PROHIBIDO usar espacios en las etiquetas.
+
+La estructura exacta de campos (2 generales + 3 específicos) y la regla de neutralidad de postura ya están definidas en el schema de respuesta — seguí esas descripciones al completar cada campo. IMPORTANTE: ignorá cualquier instrucción más abajo en este mensaje que pida devolver un campo llamado "tags" — esa instrucción quedó obsoleta; completá ÚNICAMENTE los campos definidos en el schema de respuesta (general_1, general_2, especifico_1, especifico_2, especifico_3).
 `;
 
   const messages = body['messages'] as Array<{ role: string; content: string }>;
@@ -157,7 +219,17 @@ REGLAS ESTRICTAS DE ETIQUETADO:
   }
 
   if (enriched) {
-    logger.info(`Enriched Karakeep tagging request with ${tags.length} canonical tags`);
+    // Adjuntamos response_format acá (provider-agnóstico); forwardRequest.ts
+    // lo retira según el proveedor que termine atendiendo el request.
+    body['response_format'] = {
+      type: 'json_schema',
+      json_schema: {
+        name: 'karakeep_tags_v2',
+        strict: true,
+        schema: TAGGING_RESPONSE_SCHEMA,
+      },
+    };
+    logger.info(`Enriched Karakeep tagging request with ${tags.length} canonical tags + structured output schema`);
     return Buffer.from(JSON.stringify(body), 'utf8');
   }
 
@@ -165,13 +237,23 @@ REGLAS ESTRICTAS DE ETIQUETADO:
 }
 
 /**
- * Sanitizes LLM response content to ensure all tags in {"tags": [...]} are strictly in kebab-case.
- *
- * @param onTagCount Optional callback invoked once per tagging response found,
- *   with the raw tag count the model returned (pre-truncation) — lets callers
- *   feed per-provider quality metrics without this module knowing about them.
+ * Convierte el shape de 5 campos nombrados (general_1, general_2, especifico_1..3)
+ * al formato plano {"tags": [...]} que Karakeep espera. Si el contenido ya viene
+ * como {"tags": [...]} (proveedores sin response_format, ej. Cloudflare/Ollama),
+ * lo deja pasar sin tocar.
  */
-export function sanitizeTaggingResponse(responseBuffer: Buffer, onTagCount?: (count: number) => void): Buffer {
+function normalizeStructuredTagFields(parsedContent: Record<string, unknown>): string[] | null {
+  const fieldOrder = ['general_1', 'general_2', 'especifico_1', 'especifico_2', 'especifico_3'];
+  if (!fieldOrder.every((f) => typeof parsedContent[f] === 'string')) {
+    return null;
+  }
+  return fieldOrder.map((f) => parsedContent[f] as string);
+}
+
+/**
+ * Sanitizes LLM response content to ensure all tags in {"tags": [...]} are strictly in kebab-case.
+ */
+export function sanitizeTaggingResponse(responseBuffer: Buffer): Buffer {
   if (responseBuffer.length === 0) return responseBuffer;
 
   let body: Record<string, unknown>;
@@ -193,29 +275,23 @@ export function sanitizeTaggingResponse(responseBuffer: Buffer, onTagCount?: (co
       const cleanContent = content.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/i, '').trim();
       try {
         const parsedContent = JSON.parse(cleanContent);
-        if (parsedContent && Array.isArray(parsedContent.tags)) {
-          let sanitizedTags = parsedContent.tags
-            .filter((t: unknown): t is string => typeof t === 'string' && t.trim().length > 0)
-            .map(normalizeToKebab)
-            .filter((t: string) => t.length > 0);
+        if (parsedContent && typeof parsedContent === 'object') {
+          // Shape nuevo: 5 campos nombrados (response_format estructurado) → aplanar a "tags"
+          const structuredTags = normalizeStructuredTagFields(parsedContent as Record<string, unknown>);
+          const rawTags = structuredTags ?? (Array.isArray(parsedContent.tags) ? parsedContent.tags : null);
 
-          onTagCount?.(sanitizedTags.length);
+          if (rawTags) {
+            const sanitizedTags = rawTags
+              .filter((t: unknown): t is string => typeof t === 'string' && t.trim().length > 0)
+              .map(normalizeToKebab)
+              .filter((t: string) => t.length > 0);
 
-          // Enforce the 5-tag cap requested in the enrichment prompt (2 general +
-          // 3 specific). We can't verify the general/specific split from the flat
-          // response array alone, but we CAN catch and correct a model that ignored
-          // the count — silently letting through 3 or 9 tags defeats the whole
-          // point of the fixed-quota rule.
-          if (sanitizedTags.length > 5) {
-            logger.warn(`Model returned ${sanitizedTags.length} tags, expected 5 — truncating`);
-            sanitizedTags = sanitizedTags.slice(0, 5);
-          } else if (sanitizedTags.length < 5) {
-            logger.warn(`Model returned only ${sanitizedTags.length} tags, expected 5 — passing through as-is`);
+            // Siempre devolvemos {"tags": [...]} — es lo único que Karakeep sabe leer,
+            // sin importar si el proveedor devolvió el shape de 5 campos o el viejo array.
+            const normalizedContent = { tags: sanitizedTags };
+            choice.message.content = JSON.stringify(normalizedContent);
+            modified = true;
           }
-
-          parsedContent.tags = sanitizedTags;
-          choice.message.content = JSON.stringify(parsedContent);
-          modified = true;
         }
       } catch {
         // Not JSON content, leave as is

@@ -88,7 +88,7 @@ describe('TagEnricher', () => {
     expect(enrichedContent).toContain('You must respond in JSON with the key "tags"');
   });
 
-  it('enriches tagging prompt with 2-level structure and stance-neutrality rules', () => {
+  it('enriches tagging prompt with rulesText + a structured response_format schema', () => {
     const rawPayload = {
       model: 'test-model',
       messages: [
@@ -104,21 +104,40 @@ describe('TagEnricher', () => {
     const parsed = JSON.parse(enrichedBuffer.toString('utf-8'));
     const enrichedContent = parsed.messages[0].content;
 
-    // Estructura de 2 niveles con cupos fijos (2 general + 3 específicas)
-    expect(enrichedContent).toContain('ESTRUCTURA EN 2 NIVELES OBLIGATORIA');
-    expect(enrichedContent).toContain('NIVEL GENERAL (exactamente 2 etiquetas)');
-    expect(enrichedContent).toContain('NIVEL ESPECÍFICO (exactamente 3 etiquetas)');
+    // rulesText: prioriza lista maestra solo para los campos generales
+    expect(enrichedContent).toContain('para los campos de nivel general (general_1, general_2)');
+    expect(enrichedContent).toContain('FORMATO OBLIGATORIO');
 
-    // La regla de "concepto ya cubierto" no debe eximir del nivel específico
-    expect(enrichedContent).toContain('nunca te exime de generar las 3 etiquetas específicas del nivel 2');
+    // Regla de idioma explícita (no solo implícita por escribir el prompt en español)
+    expect(enrichedContent).toContain('IDIOMA OBLIGATORIO');
+    expect(enrichedContent).toContain('PROHIBIDO usar inglés');
 
-    // Test de unicidad: una etiqueta específica no puede ser un nombre recurrente sin acompañar de lo puntual
-    expect(enrichedContent).toContain('TEST DE UNICIDAD');
-    expect(enrichedContent).toContain('serviría igual para decenas de artículos distintos');
+    // Resuelve la contradicción con la instrucción original de Karakeep ("key tags")
+    expect(enrichedContent).toContain('ignorá cualquier instrucción más abajo');
 
-    // Regla de neutralidad de postura
-    expect(enrichedContent).toContain('NEUTRALIDAD DE POSTURA');
-    expect(enrichedContent).toContain('filantrocapitalismo');
+    // response_format: el conteo/estructura ahora se fuerza a nivel de schema, no de prosa
+    expect(parsed.response_format).toBeDefined();
+    expect(parsed.response_format.type).toBe('json_schema');
+    expect(parsed.response_format.json_schema.strict).toBe(true);
+
+    const schema = parsed.response_format.json_schema.schema;
+    expect(schema.required).toEqual(['general_1', 'general_2', 'especifico_1', 'especifico_2', 'especifico_3']);
+    expect(schema.additionalProperties).toBe(false);
+
+    // Regla de neutralidad de postura vive en la descripción del schema, no en el rulesText
+    expect(schema.description).toContain('filantrocapitalismo');
+
+    // Regla de "no repetir el mismo eje" (ej. argentina / politica-argentina) vive en general_2
+    expect(schema.properties.general_2.description).toContain('mismo eje');
+
+    // Regla de unicidad ahora dividida en 2 criterios (mecánico vs. semántico) + auto-verificación
+    expect(schema.description).toContain('CRITERIO A');
+    expect(schema.description).toContain('CRITERIO B');
+    expect(schema.description).toContain('AUTO-VERIFICACIÓN OBLIGATORIA');
+    expect(schema.properties.especifico_1.description).toContain('CRITERIO A');
+
+    // Regla anti-reutilización: un valor específico no puede coincidir con lo que serviría como general
+    expect(schema.description).toContain('REGLA ANTI-REUTILIZACIÓN');
   });
 
   it('leaves non-tagging payload buffers completely untouched', () => {
@@ -150,6 +169,36 @@ describe('TagEnricher', () => {
   });
 
   describe('sanitizeTaggingResponse', () => {
+    it('flattens the structured 5-field response shape into {"tags": [...]} in kebab-case', () => {
+      const llmResponse = {
+        choices: [
+          {
+            message: {
+              role: 'assistant',
+              content: JSON.stringify({
+                general_1: 'Politica Argentina',
+                general_2: 'Economía',
+                especifico_1: 'Ley Ómnibus',
+                especifico_2: '  fondo sojero ',
+                especifico_3: 'Máximo Kirchner',
+              }),
+            },
+          },
+        ],
+      };
+
+      const buffer = Buffer.from(JSON.stringify(llmResponse), 'utf-8');
+      const sanitized = sanitizeTaggingResponse(buffer);
+
+      const parsed = JSON.parse(sanitized.toString('utf-8'));
+      const parsedContent = JSON.parse(parsed.choices[0].message.content);
+
+      // Karakeep solo sabe leer {"tags": [...]} — el shape de 5 campos nunca debe llegarle
+      expect(parsedContent).toEqual({
+        tags: ['politica-argentina', 'economía', 'ley-ómnibus', 'fondo-sojero', 'máximo-kirchner'],
+      });
+    });
+
     it('sanitizes tags in LLM JSON response to strict kebab-case', () => {
       const llmResponse = {
         id: 'chatcmpl-test',
@@ -215,52 +264,6 @@ describe('TagEnricher', () => {
       const sanitized = sanitizeTaggingResponse(buffer);
 
       expect(sanitized).toEqual(buffer);
-    });
-
-    it('truncates to 5 tags when the model returns more', () => {
-      const llmResponse = {
-        choices: [{ message: { content: '{"tags": ["a", "b", "c", "d", "e", "f", "g"]}' } }],
-      };
-      const buffer = Buffer.from(JSON.stringify(llmResponse), 'utf-8');
-      const sanitized = sanitizeTaggingResponse(buffer);
-
-      const parsed = JSON.parse(sanitized.toString('utf-8'));
-      const parsedContent = JSON.parse(parsed.choices[0].message.content);
-      expect(parsedContent.tags).toEqual(['a', 'b', 'c', 'd', 'e']);
-    });
-
-    it('passes through as-is (without inventing tags) when the model returns fewer than 5', () => {
-      const llmResponse = {
-        choices: [{ message: { content: '{"tags": ["a", "b"]}' } }],
-      };
-      const buffer = Buffer.from(JSON.stringify(llmResponse), 'utf-8');
-      const sanitized = sanitizeTaggingResponse(buffer);
-
-      const parsed = JSON.parse(sanitized.toString('utf-8'));
-      const parsedContent = JSON.parse(parsed.choices[0].message.content);
-      expect(parsedContent.tags).toEqual(['a', 'b']);
-    });
-
-    it('invokes onTagCount with the raw (pre-truncation) count for each tagging response found', () => {
-      const llmResponse = {
-        choices: [{ message: { content: '{"tags": ["a", "b", "c", "d", "e", "f"]}' } }],
-      };
-      const buffer = Buffer.from(JSON.stringify(llmResponse), 'utf-8');
-
-      const counts: number[] = [];
-      sanitizeTaggingResponse(buffer, (count) => counts.push(count));
-
-      expect(counts).toEqual([6]);
-    });
-
-    it('does not call onTagCount for a response with no tags array', () => {
-      const llmResponse = { choices: [{ message: { content: 'not json tags' } }] };
-      const buffer = Buffer.from(JSON.stringify(llmResponse), 'utf-8');
-
-      const counts: number[] = [];
-      sanitizeTaggingResponse(buffer, (count) => counts.push(count));
-
-      expect(counts).toEqual([]);
     });
   });
 });

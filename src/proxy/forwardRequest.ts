@@ -5,6 +5,7 @@ import { IncomingMessage } from 'http';
 import { createLogger } from '../logger.js';
 import { ActiveProvider } from '../providers/providerManager.js';
 import { ProviderName } from '../providers/types.js';
+import { STRUCTURED_OUTPUT_SUPPORTED_PROVIDERS } from './tagEnricher.js';
 
 const logger = createLogger('ForwardRequest');
 
@@ -51,6 +52,14 @@ export async function forwardRequest(
     try {
       const parsed = JSON.parse(rawBody.toString('utf8')) as Record<string, unknown>;
       parsed['model'] = provider.model;
+
+      // response_format con json_schema (agregado por tagEnricher.ts) solo tiene
+      // soporte confirmado en Groq/Gemini/OpenRouter. Para Cloudflare y Ollama lo
+      // retiramos — el rulesText en el prompt sigue siendo la única guía ahí.
+      if ('response_format' in parsed && !STRUCTURED_OUTPUT_SUPPORTED_PROVIDERS.has(provider.name)) {
+        delete parsed['response_format'];
+      }
+
       bodyBuffer = Buffer.from(JSON.stringify(parsed), 'utf8');
     } catch {
       // If JSON parse fails, forward as-is
@@ -105,9 +114,7 @@ export async function forwardRequest(
       bodyText.includes('PerDay') ||
       bodyText.includes('daily') ||
       bodyText.includes('tokens per day') ||
-      bodyText.includes('RESOURCE_EXHAUSTED') ||
-      bodyText.includes('free-models-per-day') ||
-      bodyText.includes('free_tier_daily')
+      bodyText.includes('RESOURCE_EXHAUSTED')
     ) {
       isDaily = true;
     }
@@ -137,6 +144,7 @@ export async function forwardRequest(
       }
       logger.info(`← ${provider.name.toUpperCase()} ${responseRaw.status} (${tokensUsed} tokens)`);
     }
+    logger.warn(`← ${provider.name.toUpperCase()} ${responseRaw.status}`);
   }
 
   return {

@@ -12,13 +12,15 @@
  * Requiere: npm install --save-dev tsx   (una sola vez)
  * Lee las API keys de tu .env real (dotenv se carga automáticamente si existe).
  *
- * Proveedores soportados (todos OpenAI-compatible /chat/completions): groq, gemini, openrouter.
- * Cloudflare y Ollama usan formatos distintos y no están cubiertos por este script.
+ * Proveedores soportados: groq, gemini, openrouter (OpenAI-compatible /chat/completions
+ * con auth por API key), y ollama (local, sin cuota ni API key — requiere tener
+ * `ollama serve` corriendo en tu máquina con el modelo ya descargado, ej. `ollama pull qwen2.5:7b`).
+ * Cloudflare usa un formato de respuesta distinto y no está cubierto.
  */
 import fs from 'fs';
 import path from 'path';
 import { loadConfig } from '../config.js';
-import { enrichTaggingRequest } from '../proxy/tagEnricher.js';
+import { enrichTaggingRequest, STRUCTURED_OUTPUT_SUPPORTED_PROVIDERS } from '../proxy/tagEnricher.js';
 
 // ── Carga simple de .env sin agregar dotenv como dependencia nueva ──────────
 function loadDotEnv(): void {
@@ -79,24 +81,49 @@ async function main(): Promise<void> {
     groq: { baseUrl: config.groq.baseUrl, apiKey: config.groq.apiKey, model: config.groq.model },
     gemini: { baseUrl: config.gemini.baseUrl, apiKey: config.gemini.apiKey, model: config.gemini.model },
     openrouter: { baseUrl: config.openrouter.baseUrl, apiKey: config.openrouter.apiKey, model: config.openrouter.model },
+    // Ollama corre local, sin cuota ni API key. El baseUrl por defecto
+    // ('host.docker.internal') solo resuelve DENTRO de un contenedor Docker —
+    // como este script corre en tu máquina directamente, lo pisamos a
+    // localhost salvo que hayas seteado OLLAMA_BASE_URL vos mismo distinto.
+    ollama: {
+      baseUrl: config.ollama.baseUrl.includes('host.docker.internal')
+        ? config.ollama.baseUrl.replace('host.docker.internal', 'localhost')
+        : config.ollama.baseUrl,
+      apiKey: 'ollama', // Ollama ignora este valor, pero el script siempre manda el header Authorization
+      model: config.ollama.model,
+    },
   };
 
   const selected = providers[providerArg];
   if (!selected) {
-    console.error(`Proveedor "${providerArg}" no soportado por este script. Usá: groq, gemini, openrouter.`);
+    console.error(`Proveedor "${providerArg}" no soportado por este script. Usá: groq, gemini, openrouter, ollama.`);
     process.exit(1);
   }
 
   const model = modelOverride || selected.model;
 
-  // Reusa el enriquecedor REAL — mismo rulesText que corre en producción
+  // Reusa el enriquecedor REAL — mismo rulesText y response_format que corre en producción
   const enrichedBuffer = enrichTaggingRequest(Buffer.from(JSON.stringify(fakeKarakeepBody), 'utf8'), tagsPath);
   const enrichedBody = JSON.parse(enrichedBuffer.toString('utf8'));
   enrichedBody.model = model;
 
+  // Mismo criterio que forwardRequest.ts: si el proveedor elegido no tiene
+  // soporte confirmado de structured output, lo sacamos antes de mandar.
+  if ('response_format' in enrichedBody && !STRUCTURED_OUTPUT_SUPPORTED_PROVIDERS.has(providerArg)) {
+    console.log(`(proveedor "${providerArg}" sin soporte confirmado de response_format — se envía solo con rulesText)\n`);
+    delete enrichedBody.response_format;
+  }
+
   const url = `${selected.baseUrl.replace(/\/$/, '')}/chat/completions`;
 
-  console.log(`→ Enviando a ${providerArg.toUpperCase()} (${model})\n`);
+  const debug = process.argv.includes('--debug');
+
+  console.log(`→ Enviando a ${providerArg.toUpperCase()} (${model})`);
+  if (debug) {
+    console.log('── response_format enviado en el request ──────────────────');
+    console.log(enrichedBody.response_format ? JSON.stringify(enrichedBody.response_format, null, 2) : '(no se envió response_format)');
+    console.log('');
+  }
 
   const res = await fetch(url, {
     method: 'POST',
@@ -107,15 +134,25 @@ async function main(): Promise<void> {
     body: JSON.stringify(enrichedBody),
   });
 
-  const data = (await res.json()) as { choices?: Array<{ message?: { content?: string } }> };
+  const data = (await res.json()) as {
+    choices?: Array<{ message?: { content?: string }; finish_reason?: string }>;
+  };
 
   if (!res.ok) {
     console.error(`✗ HTTP ${res.status}:`, JSON.stringify(data, null, 2));
     process.exit(1);
   }
 
+  if (debug) {
+    console.log('── Respuesta HTTP completa (cruda, sin procesar) ──────────');
+    console.log(JSON.stringify(data, null, 2));
+    console.log('');
+    console.log(`finish_reason: ${data?.choices?.[0]?.finish_reason ?? '(no vino)'}`);
+    console.log('');
+  }
+
   const content = data?.choices?.[0]?.message?.content;
-  console.log('── Respuesta cruda del modelo ──────────────────────────────');
+  console.log('── Respuesta cruda del modelo (message.content) ───────────');
   console.log(content ?? JSON.stringify(data, null, 2));
 }
 
