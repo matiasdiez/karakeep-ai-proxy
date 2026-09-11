@@ -248,7 +248,63 @@ resuelto) no explicaban la diferencia entre por qué a Gemini le iba bien y a
 OpenRouter no; la diferencia está en el modelo, no en el texto. Se revirtió
 el schema a la versión que le había dado buen resultado a Gemini, agregando
 un cuarto campo específico (`especifico_4`) para la siguiente ronda de
-pruebas con OpenRouter — pendiente de resultado al cierre de este documento.
+pruebas con OpenRouter.
+
+### Fase 14 — Confirmación final: la validación en código funciona en un caso real
+Después de un intento fallido por un 502 transitorio de la infraestructura
+de OpenRouter/Nvidia (no relacionado a este proyecto) y de un bug menor
+propio (una frase de recordatorio en `rulesText` que no se había actualizado
+al agregar `especifico_4`), se obtuvo el resultado definitivo: sobre el
+mismo artículo de referencia, `nemotron-3-super-120b` devolvió
+`especifico_1: cristina-fernandez-de-kirchner`, `especifico_2:
+javier-milei`, `especifico_3: dolarizacion`, `especifico_4: peronismo`. La
+validación de Criterio A en código (Fase 12) detectó y logueó correctamente
+que **3 de las 4** (`cristina-fernandez-de-kirchner`, `javier-milei`,
+`peronismo`) coinciden literalmente con la lista canónica real de 804
+tags — con certeza, sin depender de que el modelo lo note. La cuarta
+(`dolarizacion`) no está en la lista pero sigue siendo el tema macro
+recurrente de toda la cobertura de la era Milei, por lo que tampoco pasaría
+el Criterio B si se pudiera verificar automáticamente. Resultado neto: 0 de
+4 etiquetas específicas eran realmente específicas en esa corrida, pese a
+que la estructura, el conteo y el idioma salieron perfectos.
+
+Este resultado, sumado a que se probaron **cinco variantes de prompt
+distintas** (regla simple → Criterio A/B separados → ejemplo resuelto →
+reversión al schema que le funcionó a Gemini → agregar un cuarto campo) sin
+que el patrón cambiara en ningún caso, cierra la pregunta que motivó la
+Fase 11: no es un problema de redacción de instrucciones — es una prioridad
+de fondo de este modelo puntual, estable a través de todas las variantes
+probadas.
+
+### Fase 15 — Decisiones de producto tras la confirmación
+Con el diagnóstico ya cerrado, quedaron tres decisiones pendientes:
+
+1. **¿Pasar el Criterio A de "solo avisar" a "descartar automáticamente"?**
+   Se aclaró que el descarte automático solo puede aplicar al Criterio A
+   (mecánico, verificable con un `Set.has()` contra la lista canónica) —
+   nunca al Criterio B, que depende de un juicio semántico sobre qué tan
+   recurrente es un tema, algo que el código no puede determinar sin
+   información adicional (por ejemplo, contar cuántos bookmarks ya usan ese
+   tag, algo que `ai-proxy` no consulta hoy). Se decidió **aceptar el
+   Criterio B como una limitación conocida**, sin resolver por ahora.
+   Sobre el descarte del Criterio A quedó pendiente una decisión de diseño:
+   si las 4 etiquetas específicas violan el criterio (como pasó en la Fase
+   14), el bookmark quedaría con solo las 2 generales. Se aceptó ese
+   escenario como válido — es preferible a dejar pasar etiquetas recicladas
+   de la lista general — dejando planteada como mejora futura una
+   **segunda pasada** del proxy (una llamada adicional, más liviana, que
+   solo intente generar reemplazos para los campos descartados) en vez de
+   implementarla ahora.
+2. **Prioridad de proveedores**: dado que OpenRouter/Nemotron demostró ser
+   sistemáticamente el más débil en este eje específico pese a ser el
+   modelo más grande de los tres evaluados, se optó por bajarle prioridad o
+   desactivarlo en `PROVIDER_ORDER`, a la espera de evaluar también
+   Cloudflare Workers AI (todavía no testeado con este esquema al cierre de
+   este documento).
+3. **Cierre de la investigación de prompt engineering** para este problema
+   puntual — no se seguirán probando variantes de texto contra Nemotron; el
+   camino que queda abierto es exclusivamente de arquitectura (segunda
+   pasada, o descarte automático del Criterio A).
 
 ---
 
@@ -259,7 +315,7 @@ pruebas con OpenRouter — pendiente de resultado al cierre de este documento.
 | `openai/gpt-oss-20b` | Groq | Ignoró instrucciones de estructura mientras estuvieron solo en prosa (devolvía 14-17 tags en inglés). Con `response_format`, respetó el conteo y el shape correctamente. Aplica reglas de forma mecánica/literal (chequea "¿está en la lista?") pero no siempre el criterio semántico de fondo. |
 | `gemini-flash-lite-latest` / `gemini-3.1-flash-lite` | Google | Consistentemente genérico: 7-9 tags en vez de 5, sin estructura, capturando solo contenido del título/primer párrafo. |
 | `gemini-3.5-flash` | Google | El mejor resultado de toda la investigación: respetó el shape de 5-6 campos exacto, en español, y capturó contenido específico de la segunda mitad del artículo (título del documento, mecanismos concretos). Sujeto a alta demanda/disponibilidad variable. |
-| `nvidia/nemotron-3-super-120b-a12b:free` | OpenRouter | El modelo más grande probado, con razonamiento visible. Reconoce correctamente las reglas en su razonamiento interno, pero de forma repetida decide no aplicarlas cuando se trata del nombre del protagonista de la nota — un fallo de "priorización en la decisión final", no de comprensión. |
+| `nvidia/nemotron-3-super-120b-a12b:free` | OpenRouter | El modelo más grande probado, con razonamiento visible. Reconoce correctamente las reglas en su razonamiento interno, pero de forma repetida decide no aplicarlas cuando se trata del nombre del protagonista de la nota. Confirmado en Fase 14 con validación en código, a través de cinco variantes de prompt distintas — un fallo de "priorización en la decisión final", no de comprensión, y no corregible con más texto de prompt. Recomendación: baja prioridad en la rotación de proveedores para esta tarea. |
 
 ---
 
@@ -363,14 +419,27 @@ medido y esperable, no una particularidad de este proyecto.
   `gemini-3.5-flash` es hoy el más confiable; `gpt-oss-20b` (Groq) es
   aceptable pero con fallas puntuales; Nemotron es el más problemático
   específicamente en el patrón de "nombre propio como específico", pese a
-  ser el modelo más grande de los tres.
-- Ese patrón puntual se investigó a fondo (tres intentos de prompt
-  distintos) y se concluyó que no es un problema de redacción — es un límite
-  de priorización del modelo que no se resuelve agregando más texto.
+  ser el modelo más grande de los tres — confirmado con evidencia de código
+  en tráfico real (Fase 14), no solo con sospecha.
+- Ese patrón puntual se investigó a fondo (cinco intentos de prompt
+  distintos) y se concluyó, con evidencia suficiente, que no es un problema
+  de redacción — es un límite de priorización del modelo que no se resuelve
+  agregando más texto. Se cerró esa línea de investigación.
 - La validación de Criterio A se movió del prompt (poco confiable) al
   código (determinístico), como principio general: todo lo que se pueda
   verificar con certeza en código no debería depender de que el LLM lo haga
-  bien.
-- Pendiente: resultado de la prueba con `especifico_4` sobre OpenRouter, y
-  definir si conviene que el chequeo de Criterio A en código pase de
-  "solo avisar" a "descartar automáticamente" la etiqueta violatoria.
+  bien. Hoy solo diagnostica (`WARN` en el log); el Criterio B queda
+  aceptado como limitación conocida, sin verificación automática posible
+  con la información que el proxy tiene disponible hoy.
+- **Pendientes para una próxima iteración**, en orden de lo decidido:
+  1. Evaluar Cloudflare Workers AI con el mismo esquema (todavía no
+     testeado).
+  2. Bajar la prioridad de OpenRouter/Nemotron en `PROVIDER_ORDER`, o
+     desactivarlo, dado el patrón confirmado.
+  3. Decidir si el Criterio A pasa de "avisar" a "descartar
+     automáticamente" — y si se implementa, definir qué hacer con un
+     bookmark que se queda sin ninguna etiqueta específica (se aceptó que
+     puede pasar, en vez de dejar pasar una etiqueta reciclada).
+  4. Eventualmente, una **segunda pasada** del proxy que intente regenerar
+     solo los campos descartados, en vez de resignarse a perderlos —
+     quedó explícitamente pospuesta, no descartada.
